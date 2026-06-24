@@ -22,10 +22,12 @@ jobs:
         pip install -r requirements.txt
 
     - name: Run scraper
+      env:
+        # This securely bridges your GitHub Secret to your Python code
+        SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
       run: |
         python scraper.py
 
-    # This step runs even if the scraper crashes to help us see what was generated
     - name: Debug File Workspace
       if: always()
       run: |
