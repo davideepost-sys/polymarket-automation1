@@ -7,8 +7,7 @@ from datetime import datetime
 def fetch_top_traders():
     # Matches your exact GitHub Secret name
     api_key = os.getenv("SCRAPER_API_KEY")
-    target_url = "https://data-api.polymarket.com/leaderboard?window=1w&limit=100&sortBy=volume"
-    
+    target_url = "https://data-api.polymarket.com/v1/leaderboard?timePeriod=WEEK&orderBy=PNL&limit=50"    
     if not api_key:
         print("❌ Error: SCRAPER_API_KEY is missing from GitHub Secrets.")
         sys.exit(1)
