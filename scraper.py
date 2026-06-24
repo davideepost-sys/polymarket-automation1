@@ -5,16 +5,13 @@ import pandas as pd
 from datetime import datetime
 
 def fetch_top_traders():
-    # Retrieve the secret key securely from GitHub Environment Variables
     api_key = os.getenv("SCRAPER_API_KEY")
-    
     target_url = "https://lb-api.polymarket.com/leaderboard?window=1w&limit=100&sortBy=volume"
     
     if not api_key:
         print("❌ Error: SCRAPER_API_KEY is missing from GitHub Secrets.")
         sys.exit(1)
         
-    # Format the request to route through ScraperAPI
     proxy_url = "http://api.scraperapi.com"
     params = {
         'api_key': api_key,
@@ -36,8 +33,22 @@ def fetch_top_traders():
 def analyze_traders():
     data = fetch_top_traders()
     
+    # FIX: If Polymarket wraps the data in a dictionary, automatically find the data list inside it
+    if isinstance(data, dict):
+        print(f"ℹ️ API returned a dictionary container. Keys found: {list(data.keys())}")
+        list_found = False
+        for key, value in data.items():
+            if isinstance(value, list):
+                print(f"👉 Automatically extracting data list from key: '{key}'")
+                data = value
+                list_found = True
+                break
+        if not list_found:
+            print(f"❌ Could not find a data list inside the dictionary response. Content: {data}")
+            sys.exit(1)
+            
     if not isinstance(data, list):
-        print(f"❌ Unexpected API format: {type(data)}")
+        print(f"❌ Unexpected data format after processing: {type(data)}")
         sys.exit(1)
         
     print(f"Successfully retrieved {len(data)} records. Calculating custom metrics...")
@@ -45,8 +56,12 @@ def analyze_traders():
     
     for idx, entry in enumerate(data):
         try:
-            wallet = entry.get('address') or entry.get('user') or f"Unknown_{idx}"
-            profit = float(entry.get('amount') or 0)
+            if not isinstance(entry, dict):
+                continue
+                
+            # Fallbacks in case Polymarket changes header naming rules
+            wallet = entry.get('address') or entry.get('user') or entry.get('username') or f"Unknown_{idx}"
+            profit = float(entry.get('amount') or entry.get('pnl') or 0)
             volume = float(entry.get('volume') or 0)
             
             if volume <= 0:
@@ -64,7 +79,8 @@ def analyze_traders():
             continue
             
     if not traders:
-        print("❌ Data processing yielded zero valid entries.")
+        print("❌ Data processing yielded zero valid entries. Checking structural field names...")
+        print(f"Sample row structure for debugging: {data[0] if data else 'Empty list'}")
         sys.exit(1)
         
     df = pd.DataFrame(traders)
