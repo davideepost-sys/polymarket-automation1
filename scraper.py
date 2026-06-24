@@ -5,6 +5,7 @@ import pandas as pd
 from datetime import datetime
 
 def fetch_top_traders():
+    # Matches your exact GitHub Secret name
     api_key = os.getenv("SCRAPER_API_KEY")
     target_url = "https://lb-api.polymarket.com/leaderboard?window=1w&limit=100&sortBy=volume"
     
@@ -15,13 +16,15 @@ def fetch_top_traders():
     proxy_url = "http://api.scraperapi.com"
     params = {
         'api_key': api_key,
-        'url': target_url
+        'url': target_url,
+        'premium': 'true'  # 🔥 Forces residential proxies to bypass Cloudflare masking
     }
     
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Routing request through ScraperAPI tunnel...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Routing request through ScraperAPI Premium Tunnel...")
     
     try:
-        response = requests.get(proxy_url, params=params, timeout=30)
+        # Bumping timeout to 60s because residential handshakes take a few moments
+        response = requests.get(proxy_url, params=params, timeout=60)
         print(f"Proxy Response Code: {response.status_code}")
         response.raise_for_status()
         return response.json()
@@ -33,7 +36,6 @@ def fetch_top_traders():
 def analyze_traders():
     data = fetch_top_traders()
     
-    # FIX: If Polymarket wraps the data in a dictionary, automatically find the data list inside it
     if isinstance(data, dict):
         print(f"ℹ️ API returned a dictionary container. Keys found: {list(data.keys())}")
         list_found = False
@@ -44,7 +46,7 @@ def analyze_traders():
                 list_found = True
                 break
         if not list_found:
-            print(f"❌ Could not find a data list inside the dictionary response. Content: {data}")
+            print(f"❌ Could not find a data list inside the dictionary response.")
             sys.exit(1)
             
     if not isinstance(data, list):
@@ -59,7 +61,6 @@ def analyze_traders():
             if not isinstance(entry, dict):
                 continue
                 
-            # Fallbacks in case Polymarket changes header naming rules
             wallet = entry.get('address') or entry.get('user') or entry.get('username') or f"Unknown_{idx}"
             profit = float(entry.get('amount') or entry.get('pnl') or 0)
             volume = float(entry.get('volume') or 0)
@@ -79,8 +80,7 @@ def analyze_traders():
             continue
             
     if not traders:
-        print("❌ Data processing yielded zero valid entries. Checking structural field names...")
-        print(f"Sample row structure for debugging: {data[0] if data else 'Empty list'}")
+        print("❌ Data processing yielded zero valid entries.")
         sys.exit(1)
         
     df = pd.DataFrame(traders)
