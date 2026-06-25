@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -23,16 +24,10 @@ jobs:
 
     - name: Run scraper
       env:
-        # This securely bridges your GitHub Secret to your Python code
         SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
+        GRAPH_API_KEY: ${{ secrets.GRAPH_API_KEY }}   # ← THIS IS THE NEW LINE!
       run: |
         python scraper.py
-
-    - name: Debug File Workspace
-      if: always()
-      run: |
-        echo "=== Current Files in Directory ==="
-        ls -la
 
     - name: Upload results
       uses: actions/upload-artifact@v4
