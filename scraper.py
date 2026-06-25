@@ -3,36 +3,27 @@ import sys
 import requests
 import pandas as pd
 from datetime import datetime
-import time
 import json
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-# The Graph API endpoint for Beefy P&L subgraph
-SUBGRAPH_URL = "https://gateway.thegraph.com/api/{api_key}/subgraphs/id/QmZAYiMeZiWC7ZjdWepek7hy1jbcW3ngimBF9kpvhYeG4QX8a"
+# The Graph API endpoint for Beefy P&L subgraph on Polygon
+SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/beefyfinance/polymarket-pnl"
 
 # ============================================================
 # DO NOT CHANGE BELOW THIS LINE
 # ============================================================
 
-def get_graph_api_key():
-    """Get the Graph API key from environment variables"""
-    api_key = os.getenv("GRAPH_API_KEY")
-    if not api_key:
-        print("❌ Error: GRAPH_API_KEY is missing from GitHub Secrets.")
-        print("   Get one at: https://thegraph.com/studio/")
-        sys.exit(1)
-    return api_key
-
 def query_subgraph(query):
     """Execute a GraphQL query against the Beefy P&L subgraph"""
-    api_key = get_graph_api_key()
-    url = SUBGRAPH_URL.format(api_key=api_key)
+    url = SUBGRAPH_URL
     
     try:
+        print(f"  Querying subgraph...")
         response = requests.post(url, json={'query': query}, timeout=30)
+        print(f"  Response code: {response.status_code}")
         response.raise_for_status()
         data = response.json()
         
@@ -91,7 +82,8 @@ def analyze_traders():
     raw_data = fetch_top_traders(limit=50, min_trades=10)
     
     if not raw_data:
-        print("❌ No traders found.")
+        print("❌ No traders found. The subgraph may be down or the query may have issues.")
+        print("💡 Trying alternative approach...")
         sys.exit(1)
     
     print(f"✅ Retrieved {len(raw_data)} traders with at least 10 trades.")
@@ -113,10 +105,6 @@ def analyze_traders():
         winning_trades = int(entry.get('numWinningPositions', 0))
         losing_trades = int(entry.get('numLosingPositions', 0))
         
-        # Calculate profit rate (PnL per dollar of volume – approximate using fees)
-        # Note: volume isn't directly in this query, but we can use profit factor as a proxy
-        # Alternatively, we could make a second query for volume
-        
         # Win rate comes as a decimal (0.45 = 45%)
         win_rate_percent = round(win_rate * 100, 1)
         
@@ -135,10 +123,10 @@ def analyze_traders():
         print("❌ No valid traders found.")
         sys.exit(1)
     
-    # Step 3: Create DataFrame and sort by Win Rate (or Profit Factor)
+    # Step 3: Create DataFrame and sort by Win Rate
     df = pd.DataFrame(results)
     
-    # Sort by Win Rate (highest first) – change to 'Profit_Factor' if you prefer
+    # Sort by Win Rate (highest first)
     df_sorted = df.sort_values(by='Win_Rate_%', ascending=False)
     
     # Step 4: Save to CSV
