@@ -6,173 +6,157 @@ from datetime import datetime
 import time
 import json
 
-def fetch_top_traders(limit=50):
-    """Fetch top traders from Polymarket"""
-    api_key = os.getenv("SCRAPER_API_KEY")
-    target_url = f"https://data-api.polymarket.com/v1/leaderboard?timePeriod=WEEK&orderBy=PNL&limit={limit}"
-    
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# The Graph API endpoint for Beefy P&L subgraph
+SUBGRAPH_URL = "https://gateway.thegraph.com/api/{api_key}/subgraphs/id/QmZAYiMeZiWC7ZjdWepek7hy1jbcW3ngimBF9kpvhYeG4QX8a"
+
+# ============================================================
+# DO NOT CHANGE BELOW THIS LINE
+# ============================================================
+
+def get_graph_api_key():
+    """Get the Graph API key from environment variables"""
+    api_key = os.getenv("GRAPH_API_KEY")
     if not api_key:
-        print("❌ Error: SCRAPER_API_KEY is missing.")
+        print("❌ Error: GRAPH_API_KEY is missing from GitHub Secrets.")
+        print("   Get one at: https://thegraph.com/studio/")
         sys.exit(1)
-        
-    proxy_url = "http://api.scraperapi.com"
-    params = {
-        'api_key': api_key,
-        'url': target_url,
-        'premium': 'true'
-    }
-    
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top {limit} traders...")
+    return api_key
+
+def query_subgraph(query):
+    """Execute a GraphQL query against the Beefy P&L subgraph"""
+    api_key = get_graph_api_key()
+    url = SUBGRAPH_URL.format(api_key=api_key)
     
     try:
-        response = requests.get(proxy_url, params=params, timeout=60)
-        print(f"  Response code: {response.status_code}")
+        response = requests.post(url, json={'query': query}, timeout=30)
         response.raise_for_status()
         data = response.json()
-        print(f"  ✅ Retrieved {len(data) if isinstance(data, list) else 'unknown'} records")
-        return data
-    except Exception as e:
-        print(f"❌ Error fetching leaderboard: {e}")
-        sys.exit(1)
-
-def fetch_user_name(wallet):
-    """Try to fetch username from Polymarket (multiple endpoints)"""
-    api_key = os.getenv("SCRAPER_API_KEY")
-    
-    # Try different endpoints
-    endpoints = [
-        f"https://data-api.polymarket.com/v1/user/{wallet}",
-        f"https://data-api.polymarket.com/v1/users/{wallet}/profile",
-        f"https://data-api.polymarket.com/v1/account/{wallet}",
-    ]
-    
-    for endpoint in endpoints:
-        proxy_url = "http://api.scraperapi.com"
-        params = {
-            'api_key': api_key,
-            'url': endpoint,
-            'premium': 'true'
-        }
         
-        try:
-            response = requests.get(proxy_url, params=params, timeout=15)
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, dict):
-                    # Try to find any name field
-                    name = (
-                        data.get('userName') or 
-                        data.get('username') or 
-                        data.get('name') or 
-                        data.get('displayName') or
-                        data.get('nickname')
-                    )
-                    if name:
-                        return name
-        except:
-            pass
+        if 'errors' in data:
+            print(f"⚠️ GraphQL errors: {data['errors']}")
+            return None
+            
+        return data.get('data', {})
+    except Exception as e:
+        print(f"❌ Error querying subgraph: {e}")
+        return None
+
+def fetch_top_traders(limit=50, min_trades=10):
+    """
+    Fetch top traders from the Beefy P&L subgraph.
+    Returns traders ranked by total realized PnL with win rate and trade count.
+    """
+    query = f"""
+    {{
+      accounts(
+        first: {limit},
+        orderBy: totalRealizedPnl,
+        orderDirection: desc,
+        where: {{ numTrades_gte: "{min_trades}" }}
+      ) {{
+        id
+        numTrades
+        totalRealizedPnl
+        totalUnrealizedPnl
+        totalFeesPaid
+        winRate
+        profitFactor
+        maxDrawdown
+        numWinningPositions
+        numLosingPositions
+        lastTradedTimestamp
+      }}
+    }}
+    """
     
-    return None
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top {limit} traders from Beefy P&L subgraph...")
+    
+    result = query_subgraph(query)
+    
+    if not result or 'accounts' not in result:
+        print("❌ Failed to fetch trader data from subgraph.")
+        return []
+    
+    return result['accounts']
 
 def analyze_traders():
-    print("🚀 Starting Polymarket Smart Money Analyzer")
-    print("=" * 50)
+    print("🚀 Starting Polymarket Smart Money Analyzer (Beefy P&L)")
+    print("=" * 60)
     
-    # Step 1: Fetch top 50 traders
-    raw_data = fetch_top_traders(limit=50)
+    # Step 1: Fetch traders from the subgraph
+    raw_data = fetch_top_traders(limit=50, min_trades=10)
     
-    if not isinstance(raw_data, list):
-        print("❌ Error: Invalid data format.")
-        print(f"Data type: {type(raw_data)}")
-        if isinstance(raw_data, dict):
-            print(f"Keys: {list(raw_data.keys())[:5]}")
+    if not raw_data:
+        print("❌ No traders found.")
         sys.exit(1)
     
-    print(f"✅ Retrieved {len(raw_data)} traders from leaderboard.")
+    print(f"✅ Retrieved {len(raw_data)} traders with at least 10 trades.")
     
-    # Step 2: Process all traders and calculate Profit Rate
-    print("📊 Calculating efficiency scores...")
-    all_traders = []
+    # Step 2: Process the data
+    results = []
     
     for entry in raw_data:
-        # Get wallet address
-        wallet = entry.get('address') or entry.get('proxyWallet') or entry.get('user')
+        wallet = entry.get('id', '')
         if not wallet:
             continue
         
-        # Get profit and volume
-        profit = float(entry.get('pnl', 0))
-        volume = float(entry.get('vol', 0))
+        # Extract metrics
+        total_trades = int(entry.get('numTrades', 0))
+        total_pnl = float(entry.get('totalRealizedPnl', 0))
+        win_rate = float(entry.get('winRate', 0))
+        profit_factor = float(entry.get('profitFactor', 0))
+        max_drawdown = float(entry.get('maxDrawdown', 0))
+        winning_trades = int(entry.get('numWinningPositions', 0))
+        losing_trades = int(entry.get('numLosingPositions', 0))
         
-        if volume <= 0:
-            continue
+        # Calculate profit rate (PnL per dollar of volume – approximate using fees)
+        # Note: volume isn't directly in this query, but we can use profit factor as a proxy
+        # Alternatively, we could make a second query for volume
         
-        profit_rate = profit / volume
-        
-        all_traders.append({
-            'wallet': wallet,
-            'profit': profit,
-            'volume': volume,
-            'profit_rate': profit_rate
-        })
-    
-    if not all_traders:
-        print("❌ No valid traders with volume > 0.")
-        sys.exit(1)
-    
-    # Step 3: Sort by Profit Rate and take TOP 10
-    all_traders.sort(key=lambda x: x['profit_rate'], reverse=True)
-    top_10 = all_traders[:10]
-    
-    print(f"📊 Identified TOP 10 most efficient traders (out of {len(all_traders)})")
-    
-    # Step 4: Try to fetch names for TOP 10
-    print("🔍 Fetching usernames for top 10...")
-    results = []
-    
-    for idx, trader in enumerate(top_10):
-        wallet = trader['wallet']
-        print(f"  [{idx+1}/10] Processing {wallet[:10]}...")
-        
-        # Try to get the name
-        name = fetch_user_name(wallet)
-        
-        if not name:
-            name = f"{wallet[:8]}..."
+        # Win rate comes as a decimal (0.45 = 45%)
+        win_rate_percent = round(win_rate * 100, 1)
         
         results.append({
             'Wallet': wallet,
-            'Name': name,
-            'Win_Rate_%': 0,  # We'll add this if we can get it
-            'Total_Trades': 0,  # We'll add this if we can get it
-            'Profit': round(trader['profit'], 2),
-            'Volume': round(trader['volume'], 2),
-            'Profit_Rate': round(trader['profit_rate'], 4)
+            'Total_Trades': total_trades,
+            'Winning_Trades': winning_trades,
+            'Losing_Trades': losing_trades,
+            'Win_Rate_%': win_rate_percent,
+            'Total_PnL': round(total_pnl, 2),
+            'Profit_Factor': round(profit_factor, 2),
+            'Max_Drawdown_%': round(max_drawdown * 100, 1)
         })
-        
-        time.sleep(0.5)
     
-    # Step 5: Save to CSV
+    if not results:
+        print("❌ No valid traders found.")
+        sys.exit(1)
+    
+    # Step 3: Create DataFrame and sort by Win Rate (or Profit Factor)
     df = pd.DataFrame(results)
     
+    # Sort by Win Rate (highest first) – change to 'Profit_Factor' if you prefer
+    df_sorted = df.sort_values(by='Win_Rate_%', ascending=False)
+    
+    # Step 4: Save to CSV
     date_str = datetime.now().strftime("%Y%m%d")
     filename = f"smart_money_{date_str}.csv"
     
-    df.to_csv(filename, index=False)
+    df_sorted.to_csv(filename, index=False)
     
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print(f"✅ Success! File saved: {filename}")
-    print(f"📊 Found {len(df)} traders with full details")
+    print(f"📊 Found {len(df_sorted)} traders")
+    print(f"💡 All data from free Beefy P&L subgraph – 0 API credits used!")
     
-    print("\n=== TOP 5 TRADERS BY PROFIT RATE ===")
-    print(df.head(5)[['Name', 'Profit_Rate', 'Volume']].to_string(index=False))
+    print("\n=== TOP 5 TRADERS BY WIN RATE ===")
+    print(df_sorted.head(5)[['Wallet', 'Win_Rate_%', 'Total_Trades', 'Profit_Factor']].to_string(index=False))
     
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print("✅ Analysis complete!")
-    print("\n💡 Note: Win Rate is currently 0 because Polymarket's API")
-    print("   doesn't expose this data through the public endpoints.")
-    print("   You can manually look up traders at:")
-    print("   https://polymarket.com/profile/{wallet_address}")
 
 if __name__ == "__main__":
     analyze_traders()
