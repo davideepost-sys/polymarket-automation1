@@ -1,160 +1,145 @@
 import os
-import sys
 import requests
 import pandas as pd
 from datetime import datetime
 import time
 
-def fetch_top_traders(limit=50):
-    """Fetch top traders from Polymarket"""
-    api_key = os.getenv("SCRAPER_API_KEY")
-    
-    # TimePeriod=WEEK ensures the Volume and Profit we get are STRICTLY from the past week
-    target_url = f"https://data-api.polymarket.com/v1/leaderboard?timePeriod=WEEK&orderBy=PNL&limit={limit}"
-    
-    if not api_key:
-        print("❌ Error: SCRAPER_API_KEY is missing.")
-        sys.exit(1)
-        
-    proxy_url = "http://api.scraperapi.com"
-    params = {
-        'api_key': api_key,
-        'url': target_url
+# --- KONFIGURATION ---
+# Hämtar API-nyckel från miljövariabler (Environment Variables) i GitHub Actions
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "DIN_API_NYCKEL_HÄR")
+
+def fetch_from_polymarket(target_url):
+    """
+    Hjälpfunktion för att anropa ScraperAPI. 
+    Tvingar 'premium': 'true' för att undvika 403/404 från Cloudflare.
+    """
+    payload = {
+        'api_key': SCRAPER_API_KEY,
+        'url': target_url,
+        'premium': 'true',
+        'render': 'false' # Vi behöver bara JSON-data, inte rendera JavaScript
     }
     
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top {limit} traders for the week...")
-    
     try:
-        response = requests.get(proxy_url, params=params, timeout=60)
+        response = requests.get('http://api.scraperapi.com', params=payload, timeout=60)
         response.raise_for_status()
         return response.json()
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        sys.exit(1)
+    except requests.exceptions.RequestException as e:
+        print(f"[FEL] API-anrop misslyckades för URL: {target_url} | Fel: {e}")
+        return None
 
-def fetch_trader_data(wallet):
-    """Fetch trader name and win rate"""
-    api_key = os.getenv("SCRAPER_API_KEY")
+def main():
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Startar Smart Money Scraper...")
     
-    # Adding timePeriod=WEEK to attempt pulling weekly stats specifically
-    target_url = f"https://data-api.polymarket.com/v1/users/{wallet}/stats?timePeriod=WEEK"
+    # 1. Hämta Topp 50 från Leaderboard
+    leaderboard_url = "https://data-api.polymarket.com/v1/leaderboard?timePeriod=WEEK&orderBy=PNL&limit=50"
+    print("[1/4] Hämtar Leaderboard (Top 50)...")
     
-    proxy_url = "http://api.scraperapi.com"
-    params = {
-        'api_key': api_key,
-        'url': target_url
-    }
+    leaderboard_data = fetch_from_polymarket(leaderboard_url)
     
-    try:
-        response = requests.get(proxy_url, params=params, timeout=30)
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, dict):
-                # Flexible key checks in case Polymarket updates their response structure
-                name = data.get('userName') or data.get('username') or data.get('name')
-                
-                total_trades = float(data.get('totalTrades') or data.get('tradesCount') or data.get('trades') or 0)
-                winning_trades = float(data.get('winningTrades') or data.get('successfulTrades') or data.get('wins') or 0)
-                
-                win_rate = data.get('winRate')
-                if win_rate is None:
-                    win_rate = round((winning_trades / total_trades) * 100, 1) if total_trades > 0 else 0
-                    
-                return name, float(win_rate), int(total_trades)
-    except Exception as e:
-        print(f"  ⚠️ Could not fetch stats: {e}")
-    
-    return None, 0, 0
+    if not leaderboard_data or not isinstance(leaderboard_data, list):
+        print("[AVBRYTER] Kunde inte hämta Leaderboard-data korrekt.")
+        return
 
-def analyze_traders():
-    # 1. Fetch Top 50 traders (Only 1 API call)
-    raw_data = fetch_top_traders(limit=50)
+    traders = []
     
-    if not isinstance(raw_data, list):
-        print("❌ Error: Invalid data format.")
-        sys.exit(1)
-        
-    print(f"✅ Retrieved {len(raw_data)} traders. Calculating base metrics locally to save credits...")
-    
-    basic_traders = []
-    
-    for idx, entry in enumerate(raw_data):
-        # 🔥 CRITICAL FIX: The stats API requires the MAIN 'address', NOT the 'proxyWallet'.
-        wallet = entry.get('address') or entry.get('user') or entry.get('proxyWallet')
-        lb_name = entry.get('username') or entry.get('name')
-        
+    # 2. Parsa Leaderboard & Beräkna Profit Rate
+    print("[2/4] Beräknar lokal Profit Rate och filtrerar noll-volym...")
+    for item in leaderboard_data:
+        # Säkerställ att vi har en adress
+        wallet = item.get('address') or item.get('user') or item.get('proxyWallet')
         if not wallet:
             continue
             
-        profit = float(entry.get('pnl', 0) or entry.get('amount', 0))
-        volume = float(entry.get('vol', 0) or entry.get('volume', 0))
+        profit = float(item.get('pnl', 0))
+        volume = float(item.get('volume', 0))
         
+        # Hoppa över om volymen är 0 för att undvika DivisionByZero
         if volume <= 0:
             continue
             
-        profit_rate = round(profit / volume, 4)
+        profit_rate = profit / volume
         
-        basic_traders.append({
+        traders.append({
             'Wallet': wallet,
-            'Leaderboard_Name': lb_name,
-            'Profit': round(profit, 2),
-            'Volume': round(volume, 2),
+            'Profit': profit,
+            'Volume': volume,
             'Profit_Rate': profit_rate
         })
         
-    if not basic_traders:
-        print("❌ No valid traders found.")
-        sys.exit(1)
-        
-    df = pd.DataFrame(basic_traders)
+    # Sortera lokalt (Högst Profit Rate först) och ta Topp 10
+    top_10_traders = sorted(traders, key=lambda x: x['Profit_Rate'], reverse=True)[:10]
     
-    # 2. Sort by Profit Rate FIRST
-    df_sorted = df.sort_values(by='Profit_Rate', ascending=False)
+    # 3. Detaljerade API-anrop endast för Top 10
+    print(f"[3/4] Hämtar User Stats för de {len(top_10_traders)} mest effektiva traders...")
     
-    # 3. ONLY fetch detailed stats for the Top 10 to drastically cut API costs
-    TOP_N = 10
-    top_traders = df_sorted.head(TOP_N).copy()
+    final_results = []
     
-    print(f"\n💡 Smart Scraping: Only fetching deep stats for the Top {TOP_N} most efficient traders.")
-    print(f"This reduces your API calls from {len(raw_data)+1} down to just {TOP_N+1}!\n")
-    
-    final_traders = []
-    total_requests_made = 1 # 1 for the initial leaderboard fetch
-    
-    for idx, row in enumerate(top_traders.itertuples()):
-        print(f"  [{idx+1}/{TOP_N}] Fetching stats for {row.Wallet[:8]}...")
+    for i, trader in enumerate(top_10_traders):
+        wallet = trader['Wallet']
+        stats_url = f"https://data-api.polymarket.com/v1/users/{wallet}/stats?timePeriod=WEEK"
         
-        name, win_rate, trade_count = fetch_trader_data(row.Wallet)
-        total_requests_made += 1
+        print(f"  -> Fetching stats for trader {i+1}/10 ({wallet[:8]}...)")
+        stats_data = fetch_from_polymarket(stats_url)
         
-        # Fallbacks for the name if the stats API comes up empty
-        final_name = name if name else (row.Leaderboard_Name if row.Leaderboard_Name else row.Wallet[:8] + "...")
+        # Sätt standardvärden (Fallbacks)
+        name = wallet[:8] + "..."
+        win_rate = 0.0
+        total_trades = 0
         
-        final_traders.append({
-            'Wallet': row.Wallet,
-            'Name': final_name,
-            'Win_Rate_%': win_rate,
-            'Total_Trades': trade_count,
-            'Profit': row.Profit,
-            'Volume': row.Volume,
-            'Profit_Rate': row.Profit_Rate
-        })
+        if stats_data:
+            # Polymarkets JSON-struktur kan variera, vi letar efter flera möjliga nycklar
+            name = stats_data.get('userName') or stats_data.get('username') or name
+            
+            # Försök hämta totala trades
+            total_trades = stats_data.get('totalTrades') or stats_data.get('tradesCount') or 0
+            
+            # Försök hämta win rate (antingen direkt, eller beräkna från vinst/förlust)
+            if 'winRate' in stats_data:
+                win_rate = float(stats_data['winRate'])
+            else:
+                winning_trades = stats_data.get('winningTrades', 0)
+                if total_trades > 0:
+                    win_rate = (winning_trades / total_trades) * 100
+        else:
+            print(f"     [VARNING] Kunde inte hämta data för {wallet[:8]}. Använder fallback-värden.")
+
+        # Uppdatera traderns data
+        trader_full_data = {
+            'Wallet': wallet,
+            'Name': name,
+            'Win_Rate_%': round(win_rate, 2),
+            'Total_Trades': int(total_trades),
+            'Profit': round(trader['Profit'], 2),
+            'Volume': round(trader['Volume'], 2),
+            'Profit_Rate': round(trader['Profit_Rate'], 4)
+        }
+        final_results.append(trader_full_data)
         
+        # Vänta 0.5 sekunder för att undvika Rate Limits
         time.sleep(0.5)
-        
-    df_final = pd.DataFrame(final_traders)
+
+    # 4. Skapa DataFrame och spara till CSV
+    print("[4/4] Skapar CSV och sammanfattning...")
+    df = pd.DataFrame(final_results)
     
-    date_str = datetime.now().strftime("%Y%m%d")
-    filename = f"smart_money_{date_str}.csv"
+    # Ordna kolumnerna snyggt
+    cols_order = ['Wallet', 'Name', 'Win_Rate_%', 'Total_Trades', 'Profit', 'Volume', 'Profit_Rate']
+    df = df[cols_order]
     
-    df_final.to_csv(filename, index=False)
+    # Skapa filnamn med dagens datum
+    date_str = datetime.now().strftime('%Y%m%d')
+    csv_filename = f"smart_money_{date_str}.csv"
     
-    print(f"\n✅ Success! File saved: {filename}")
-    print(f"📊 Processed the Top {TOP_N} traders.")
-    print(f"💰 APIs Called: {total_requests_made} (Costing ~{total_requests_made * 10} ScraperAPI credits instead of 210+)")
+    df.to_csv(csv_filename, index=False)
     
-    print("\n=== TOP 5 TRADERS BY PROFIT RATE ===")
-    print(df_final.head(5)[['Name', 'Win_Rate_%', 'Profit_Rate', 'Volume']].to_string(index=False))
+    print(f"\n✅ Framgång! Sparad till filen: {csv_filename}")
+    print("\n--- TOPP 5 SMART MONEY TRADERS ---")
+    
+    # Skriv ut en snygg sammanfattning av de 5 bästa i terminalen (viktigt för GitHub Actions loggar)
+    top_5 = df.head(5)
+    for index, row in top_5.iterrows():
+        print(f"{index+1}. {row['Name']:<15} | Win Rate: {row['Win_Rate_%']:>5}% | Profit Rate: {row['Profit_Rate']:.4f} | Vol: ${row['Volume']}")
 
 if __name__ == "__main__":
-    analyze_traders()
+    main()
