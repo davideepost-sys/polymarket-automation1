@@ -25,7 +25,6 @@ jobs:
     - name: Run scraper
       env:
         SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
-        APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
       run: |
         python scraper.py
 
