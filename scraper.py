@@ -3,7 +3,7 @@ import sys
 import requests
 import pandas as pd
 from datetime import datetime
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 import time
 
 # ============================================================
@@ -25,22 +25,21 @@ DATA_API = "https://data-api.polymarket.com"
 
 def fetch_from_polymarket(target_url, query_params=None):
     """
-    Fetch data from Polymarket via ScraperAPI proxy.
+    Fetch JSON from a Polymarket endpoint via ScraperAPI.
 
-    Key fix: the full Polymarket URL (including its own query string) must be
-    built first and passed as a *single* 'url' value to ScraperAPI.  If we let
-    the `requests` library append ScraperAPI's params it will percent-encode
-    '?' and '&' inside the target URL, producing a 404 on Polymarket's side.
+    ScraperAPI requires the full target URL (including its own query string)
+    to be passed as a single pre-encoded 'url' parameter.  We build that URL
+    ourselves with urlencode() and then percent-encode the whole thing into
+    the ScraperAPI query string — so the requests library has nothing left
+    to re-encode and cannot corrupt the '?' or '&' separators.
     """
-    # 1. Build the complete Polymarket target URL first
     if query_params:
         target_url = f"{target_url}?{urlencode(query_params)}"
 
-    # 2. Build the ScraperAPI proxy URL with the full target URL as a plain string
     proxy_url = (
         f"https://api.scraperapi.com"
         f"?api_key={SCRAPER_API_KEY}"
-        f"&url={requests.utils.quote(target_url, safe='')}"
+        f"&url={quote(target_url, safe='')}"
         f"&premium=true"
     )
 
@@ -55,9 +54,10 @@ def fetch_from_polymarket(target_url, query_params=None):
 
 def fetch_markets_traded(proxy_wallet):
     """
-    Number of markets the trader has ever traded.
-    Endpoint: GET /traded?user=<wallet>
-    Response: { "user": "0x...", "traded": <int> }
+    GET /traded?user=<wallet>
+    Official docs: /api-spec/data-openapi.yaml  path: /traded
+    Response shape: { "user": "0x...", "traded": <int> }
+    Note: no /v1/ prefix — this endpoint lives at the root.
     """
     data = fetch_from_polymarket(
         f"{DATA_API}/traded",
@@ -70,17 +70,27 @@ def fetch_markets_traded(proxy_wallet):
 
 def fetch_win_rate(proxy_wallet):
     """
-    Derive win rate from resolved positions.
+    Derive win rate from the user's current positions.
 
-    Polymarket has no native winRate field.  We call /positions and look at
-    every position whose market has resolved (redeemable=True or cashPnl set).
-      wins   = resolved positions where cashPnl > 0
-      losses = resolved positions where cashPnl <= 0
-      win_rate = wins / (wins + losses) * 100
+    Polymarket has no native winRate field anywhere in its public API.
+    We call GET /positions and count only resolved positions:
+      - redeemable=True  →  market has settled, we can redeem
+      - cashPnl is set   →  realised P&L is available
+
+    wins   = resolved positions where cashPnl > 0
+    losses = resolved positions where cashPnl <= 0
+    win_rate = wins / (wins + losses) * 100
+
+    Official docs: /api-spec/data-openapi.yaml  path: /positions
+    Note: no /v1/ prefix — this endpoint lives at the root.
     """
     data = fetch_from_polymarket(
         f"{DATA_API}/positions",
-        query_params={"user": proxy_wallet, "sizeThreshold": "0.01"}
+        query_params={
+            "user": proxy_wallet,
+            "sizeThreshold": "0.01",
+            "limit": "500"
+        }
     )
 
     if not data or not isinstance(data, list):
@@ -103,11 +113,8 @@ def fetch_win_rate(proxy_wallet):
             except (TypeError, ValueError):
                 continue
 
-    total_resolved = wins + losses
-    if total_resolved == 0:
-        return 0.0
-
-    return round((wins / total_resolved) * 100, 1)
+    total = wins + losses
+    return round((wins / total) * 100, 1) if total > 0 else 0.0
 
 
 def analyze_traders():
@@ -115,9 +122,13 @@ def analyze_traders():
     print("=" * 60)
 
     # ── Step 1: Leaderboard ────────────────────────────────────────
+    # Official path: GET /v1/leaderboard  (note the /v1/ prefix!)
+    # Valid timePeriod values: DAY | WEEK | MONTH | ALL
+    # Valid orderBy values:    PNL | VOL
+    # Max limit: 50
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top 10 traders...")
     leaderboard_data = fetch_from_polymarket(
-        f"{DATA_API}/leaderboard",
+        f"{DATA_API}/v1/leaderboard",
         query_params={"timePeriod": "WEEK", "orderBy": "PNL", "limit": "10"}
     )
 
@@ -132,18 +143,16 @@ def analyze_traders():
     results = []
 
     for idx, entry in enumerate(leaderboard_data):
-        wallet = (
-            entry.get("proxyWallet")
-            or entry.get("address")
-            or entry.get("user")
-        )
+        # Leaderboard returns proxyWallet (not 'address' or 'user')
+        wallet = entry.get("proxyWallet")
         if not wallet:
-            print(f"  [{idx+1}] ⚠️  No wallet found, skipping.")
+            print(f"  [{idx+1}] ⚠️  No proxyWallet found, skipping.")
             continue
 
-        username     = entry.get("userName") or entry.get("xUsername") or wallet[:8] + "..."
-        pnl          = float(entry.get("pnl", 0))
-        volume       = float(entry.get("vol", 0))
+        # userName is returned directly on the leaderboard entry
+        username = entry.get("userName") or entry.get("xUsername") or wallet[:8] + "..."
+        pnl      = float(entry.get("pnl", 0))
+        volume   = float(entry.get("vol", 0))
 
         if volume <= 0:
             print(f"  [{idx+1}] ⚠️  Zero volume for {wallet[:10]}, skipping.")
@@ -151,13 +160,13 @@ def analyze_traders():
 
         profit_rate = round(pnl / volume, 4)
 
-        print(f"  [{idx+1}/10] {username} | fetching trades...")
+        print(f"  [{idx+1}/10] {username} | fetching markets traded...")
         markets_traded = fetch_markets_traded(wallet)
-        time.sleep(0.4)
+        time.sleep(0.5)
 
         print(f"  [{idx+1}/10] {username} | calculating win rate...")
         win_rate = fetch_win_rate(wallet)
-        time.sleep(0.4)
+        time.sleep(0.5)
 
         results.append({
             "Wallet":         wallet,
@@ -199,4 +208,3 @@ def analyze_traders():
 
 if __name__ == "__main__":
     analyze_traders()
-                
