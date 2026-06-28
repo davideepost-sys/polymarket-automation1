@@ -3,6 +3,7 @@ import sys
 import requests
 import pandas as pd
 from datetime import datetime
+from urllib.parse import urlencode
 import time
 
 # ============================================================
@@ -21,22 +22,30 @@ if not SCRAPER_API_KEY:
 
 DATA_API = "https://data-api.polymarket.com"
 
-def fetch_from_polymarket(target_url, params=None):
-    """Fetch data from Polymarket using ScraperAPI proxy."""
-    proxy_url = "http://api.scraperapi.com"
-    scraper_params = {
-        "api_key": SCRAPER_API_KEY,
-        "url": target_url,
-        "premium": "true",  # Required to bypass Cloudflare
-    }
-    # Append any extra query params into the target URL manually
-    if params:
-        query_string = "&".join(f"{k}={v}" for k, v in params.items())
-        separator = "&" if "?" in target_url else "?"
-        scraper_params["url"] = f"{target_url}{separator}{query_string}"
+
+def fetch_from_polymarket(target_url, query_params=None):
+    """
+    Fetch data from Polymarket via ScraperAPI proxy.
+
+    Key fix: the full Polymarket URL (including its own query string) must be
+    built first and passed as a *single* 'url' value to ScraperAPI.  If we let
+    the `requests` library append ScraperAPI's params it will percent-encode
+    '?' and '&' inside the target URL, producing a 404 on Polymarket's side.
+    """
+    # 1. Build the complete Polymarket target URL first
+    if query_params:
+        target_url = f"{target_url}?{urlencode(query_params)}"
+
+    # 2. Build the ScraperAPI proxy URL with the full target URL as a plain string
+    proxy_url = (
+        f"https://api.scraperapi.com"
+        f"?api_key={SCRAPER_API_KEY}"
+        f"&url={requests.utils.quote(target_url, safe='')}"
+        f"&premium=true"
+    )
 
     try:
-        response = requests.get(proxy_url, params=scraper_params, timeout=60)
+        response = requests.get(proxy_url, timeout=60)
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -46,13 +55,14 @@ def fetch_from_polymarket(target_url, params=None):
 
 def fetch_markets_traded(proxy_wallet):
     """
-    Fetch the number of markets a user has traded via /traded endpoint.
-    Returns an integer count, or 0 on failure.
-    Docs: https://docs.polymarket.com/api-reference/misc/get-total-markets-a-user-has-traded
-    Response shape: { "user": "0x...", "traded": <int> }
+    Number of markets the trader has ever traded.
+    Endpoint: GET /traded?user=<wallet>
+    Response: { "user": "0x...", "traded": <int> }
     """
-    target_url = f"{DATA_API}/traded"
-    data = fetch_from_polymarket(target_url, params={"user": proxy_wallet})
+    data = fetch_from_polymarket(
+        f"{DATA_API}/traded",
+        query_params={"user": proxy_wallet}
+    )
     if data and isinstance(data, dict):
         return int(data.get("traded", 0))
     return 0
@@ -60,22 +70,18 @@ def fetch_markets_traded(proxy_wallet):
 
 def fetch_win_rate(proxy_wallet):
     """
-    Calculate win rate from the user's resolved positions.
+    Derive win rate from resolved positions.
 
-    Polymarket has no native winRate field — we derive it from /positions.
-    A position is considered 'resolved' when its market is closed (redeemable=true
-    or the position has a cashPnl value attached to a resolved market).
-
-    We count:
-      - wins:   resolved positions where cashPnl > 0
-      - losses: resolved positions where cashPnl <= 0
-      - win_rate = wins / (wins + losses) * 100
-
-    Docs: https://docs.polymarket.com/api-reference/core (positions endpoint)
-    Response items include: cashPnl, redeemable, title, outcome, ...
+    Polymarket has no native winRate field.  We call /positions and look at
+    every position whose market has resolved (redeemable=True or cashPnl set).
+      wins   = resolved positions where cashPnl > 0
+      losses = resolved positions where cashPnl <= 0
+      win_rate = wins / (wins + losses) * 100
     """
-    target_url = f"{DATA_API}/positions"
-    data = fetch_from_polymarket(target_url, params={"user": proxy_wallet, "sizeThreshold": "0.01"})
+    data = fetch_from_polymarket(
+        f"{DATA_API}/positions",
+        query_params={"user": proxy_wallet, "sizeThreshold": "0.01"}
+    )
 
     if not data or not isinstance(data, list):
         return 0.0
@@ -84,11 +90,8 @@ def fetch_win_rate(proxy_wallet):
     losses = 0
 
     for pos in data:
-        # Only count resolved/redeemable positions for win rate
-        # (open positions haven't settled yet so we skip them)
         redeemable = pos.get("redeemable", False)
-        # Also check if the position has a realized cashPnl from a closed market
-        cash_pnl = pos.get("cashPnl")
+        cash_pnl   = pos.get("cashPnl")
 
         if redeemable or cash_pnl is not None:
             try:
@@ -111,21 +114,18 @@ def analyze_traders():
     print("🚀 Starting Polymarket Smart Money Analyzer")
     print("=" * 60)
 
-    # ── Step 1: Fetch top leaderboard traders ──────────────────────
-    # The leaderboard already returns userName directly — no second
-    # profile call is needed just to get the name.
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top 10 traders from leaderboard...")
-    leaderboard_url = (
-        f"{DATA_API}/leaderboard"
-        "?timePeriod=WEEK&orderBy=PNL&limit=10"
+    # ── Step 1: Leaderboard ────────────────────────────────────────
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top 10 traders...")
+    leaderboard_data = fetch_from_polymarket(
+        f"{DATA_API}/leaderboard",
+        query_params={"timePeriod": "WEEK", "orderBy": "PNL", "limit": "10"}
     )
-    leaderboard_data = fetch_from_polymarket(leaderboard_url)
 
     if not leaderboard_data or not isinstance(leaderboard_data, list):
         print("❌ Failed to fetch leaderboard data.")
         sys.exit(1)
 
-    print(f"✅ Retrieved {len(leaderboard_data)} traders from leaderboard.")
+    print(f"✅ Retrieved {len(leaderboard_data)} traders.")
 
     # ── Step 2: Enrich each trader ─────────────────────────────────
     print("📊 Enriching trader data (markets traded + win rate)...")
@@ -138,14 +138,12 @@ def analyze_traders():
             or entry.get("user")
         )
         if not wallet:
-            print(f"  [{idx+1}] ⚠️  No wallet found, skipping entry.")
+            print(f"  [{idx+1}] ⚠️  No wallet found, skipping.")
             continue
 
-        # Name is already on the leaderboard response as 'userName'
-        username = entry.get("userName") or entry.get("xUsername") or wallet[:8] + "..."
-
-        pnl = float(entry.get("pnl", 0))
-        volume = float(entry.get("vol", 0))
+        username     = entry.get("userName") or entry.get("xUsername") or wallet[:8] + "..."
+        pnl          = float(entry.get("pnl", 0))
+        volume       = float(entry.get("vol", 0))
 
         if volume <= 0:
             print(f"  [{idx+1}] ⚠️  Zero volume for {wallet[:10]}, skipping.")
@@ -153,11 +151,11 @@ def analyze_traders():
 
         profit_rate = round(pnl / volume, 4)
 
-        print(f"  [{idx+1}/10] {username} | Fetching markets traded...")
+        print(f"  [{idx+1}/10] {username} | fetching trades...")
         markets_traded = fetch_markets_traded(wallet)
-        time.sleep(0.4)  # Avoid hammering the API / ScraperAPI quota
+        time.sleep(0.4)
 
-        print(f"         {username} | Calculating win rate...")
+        print(f"  [{idx+1}/10] {username} | calculating win rate...")
         win_rate = fetch_win_rate(wallet)
         time.sleep(0.4)
 
@@ -172,24 +170,22 @@ def analyze_traders():
         })
 
         print(
-            f"         ✅ Done | Traded: {markets_traded} | "
+            f"         ✅ Traded: {markets_traded} | "
             f"Win Rate: {win_rate}% | Profit: ${pnl:,.0f}"
         )
 
     if not results:
-        print("❌ No valid traders found after enrichment.")
+        print("❌ No valid traders found.")
         sys.exit(1)
 
-    # ── Step 3: Build DataFrame and sort ──────────────────────────
-    df = pd.DataFrame(results)
+    # ── Step 3: Sort & save ────────────────────────────────────────
+    df        = pd.DataFrame(results)
     df_sorted = df.sort_values(by="Win_Rate_%", ascending=False)
 
-    # ── Step 4: Save CSV ───────────────────────────────────────────
     date_str = datetime.now().strftime("%Y%m%d")
     filename = f"smart_money_{date_str}.csv"
     df_sorted.to_csv(filename, index=False)
 
-    # ── Step 5: Print summary ──────────────────────────────────────
     print("\n" + "=" * 60)
     print(f"✅ Saved: {filename}  ({len(df_sorted)} traders)")
     print("\n=== TOP 10 TRADERS (sorted by Win Rate) ===")
@@ -203,5 +199,4 @@ def analyze_traders():
 
 if __name__ == "__main__":
     analyze_traders()
-
                 
