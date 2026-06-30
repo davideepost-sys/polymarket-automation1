@@ -1,6 +1,3 @@
-bash
-
-cat > /mnt/user-data/outputs/scraper.py << 'PYEOF'
 import os
 import sys
 import requests
@@ -410,5 +407,3 @@ def analyze_traders():
 
 if __name__ == "__main__":
     analyze_traders()
-PYEOF
-echo "done"
