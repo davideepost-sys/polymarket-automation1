@@ -3,7 +3,7 @@ import sys
 import requests
 import pandas as pd
 from datetime import datetime, timezone
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
@@ -16,16 +16,19 @@ if not SCRAPER_API_KEY:
     print("❌ Error: SCRAPER_API_KEY is missing from GitHub Secrets.")
     sys.exit(1)
 
+# ── ScraperAPI settings ──────────────────────────────────────
+USE_PREMIUM = True   # Set to False if you're on the free tier
+
 # ── Trade count filter (weekly) ──────────────────────────────
-MIN_WEEKLY_TRADES = 10    # catch slower traders
-MAX_WEEKLY_TRADES = 1000  # include more active traders
+MIN_WEEKLY_TRADES = 10
+MAX_WEEKLY_TRADES = 1000
 
 # ── Win rate sample size ──────────────────────────────────────
 WIN_RATE_LOOKBACK_PAGES = 15   # up to 750 resolved positions
-MIN_SAMPLE_SIZE = 10           # only show traders with at least this many resolved trades
+MIN_SAMPLE_SIZE = 10
 
-LEADERBOARD_POOL_SIZE = 100    # scan top 100 traders
-MAX_WORKERS = 5                # raise to 10 if your ScraperAPI plan allows
+LEADERBOARD_POOL_SIZE = 100
+MAX_WORKERS = 5
 
 # ============================================================
 # DO NOT CHANGE BELOW THIS LINE
@@ -38,14 +41,15 @@ WEEK_AGO_TS = NOW_TS - (7 * 24 * 60 * 60)
 
 
 def fetch_from_polymarket(target_url, query_params=None):
+    # Build the full target URL
     if query_params:
         target_url = f"{target_url}?{urlencode(query_params)}"
-    proxy_url = (
-        f"https://api.scraperapi.com"
-        f"?api_key={SCRAPER_API_KEY}"
-        f"&url={quote(target_url, safe='')}"
-        f"&premium=true"
-    )
+    
+    # Build ScraperAPI proxy URL
+    proxy_url = f"https://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={target_url}"
+    if USE_PREMIUM:
+        proxy_url += "&premium=true"
+    
     try:
         response = requests.get(proxy_url, timeout=60)
         response.raise_for_status()
@@ -55,7 +59,7 @@ def fetch_from_polymarket(target_url, query_params=None):
         return None
 
 
-def count_weekly_trades(proxy_wallet, count_cap=1100):  # increased cap
+def count_weekly_trades(proxy_wallet, count_cap=1100):
     total = 0
     offset = 0
     page_size = 500
@@ -89,6 +93,7 @@ def fetch_recent_win_rate(proxy_wallet):
     pushes = 0
     win_amounts = []
     loss_amounts = []
+    resolution_timestamps = []
     oldest_ts = None
 
     for page in range(WIN_RATE_LOOKBACK_PAGES):
@@ -117,7 +122,9 @@ def fetch_recent_win_rate(proxy_wallet):
                 pnl_val   = float(realized_pnl) if realized_pnl is not None else 0.0
             except (TypeError, ValueError):
                 continue
+
             if ts is not None:
+                resolution_timestamps.append(ts)
                 if oldest_ts is None or ts < oldest_ts:
                     oldest_ts = ts
 
@@ -149,6 +156,14 @@ def fetch_recent_win_rate(proxy_wallet):
     avg_loss = round(sum(loss_amounts) / len(loss_amounts), 2) if loss_amounts else 0.0
     span_days = round((NOW_TS - oldest_ts) / 86400, 1) if oldest_ts else None
 
+    if resolution_timestamps:
+        avg_age_sec = sum(NOW_TS - ts for ts in resolution_timestamps) / len(resolution_timestamps)
+        avg_age_days = round(avg_age_sec / 86400, 1)
+        recent_7d = sum(1 for ts in resolution_timestamps if NOW_TS - ts <= 7 * 86400)
+    else:
+        avg_age_days = None
+        recent_7d = 0
+
     return {
         "win_rate":           win_rate,
         "total_sample":       total,
@@ -160,6 +175,8 @@ def fetch_recent_win_rate(proxy_wallet):
         "avg_win":            avg_win,
         "avg_loss":           avg_loss,
         "sample_span_days":   span_days,
+        "avg_resolve_age_days": avg_age_days,
+        "recent_resolves_7d":   recent_7d,
     }
 
 
@@ -195,20 +212,23 @@ def analyze_one_survivor(trader):
     win_rate_display = wr["win_rate"] if wr["win_rate"] is not None else "N/A"
     print(
         f"  {username:<20} Win Rate: {win_rate_display}% "
-        f"(sample {wr['total_sample']}, span {wr['sample_span_days']}d)"
+        f"(sample {wr['total_sample']}, span {wr['sample_span_days']}d, "
+        f"avg resolve age {wr['avg_resolve_age_days']}d, recent7d {wr['recent_resolves_7d']})"
     )
     return {
         **trader,
-        "Win_Rate_%":         win_rate_display,
-        "Total_Sample":       wr["total_sample"],
-        "Sample_Span_Days":   wr["sample_span_days"],
-        "Resolved_Wins":      wr["resolved_wins"],
-        "Resolved_Losses":    wr["resolved_losses"],
-        "Early_Exit_Wins":    wr["early_exit_wins"],
-        "Early_Exit_Losses":  wr["early_exit_losses"],
-        "Pushes":             wr["pushes"],
-        "Avg_Win_$":          wr["avg_win"],
-        "Avg_Loss_$":         wr["avg_loss"],
+        "Win_Rate_%":            win_rate_display,
+        "Total_Sample":          wr["total_sample"],
+        "Sample_Span_Days":      wr["sample_span_days"],
+        "Resolved_Wins":         wr["resolved_wins"],
+        "Resolved_Losses":       wr["resolved_losses"],
+        "Early_Exit_Wins":       wr["early_exit_wins"],
+        "Early_Exit_Losses":     wr["early_exit_losses"],
+        "Pushes":                wr["pushes"],
+        "Avg_Win_$":             wr["avg_win"],
+        "Avg_Loss_$":            wr["avg_loss"],
+        "Avg_Resolve_Age_Days":  wr["avg_resolve_age_days"],
+        "Recent_Resolves_7d":    wr["recent_resolves_7d"],
     }
 
 
@@ -218,9 +238,9 @@ def analyze_traders():
     print(f"   Trade filter: {MIN_WEEKLY_TRADES}–{MAX_WEEKLY_TRADES} trades/week")
     print(f"   Win rate basis: up to {WIN_RATE_LOOKBACK_PAGES*50} resolved positions (minimum sample {MIN_SAMPLE_SIZE})")
     print(f"   Parallel workers: {MAX_WORKERS}")
+    print(f"   ScraperAPI premium: {USE_PREMIUM}")
     print("=" * 60)
 
-    # Step 1 – fetch top leaderboard
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top {LEADERBOARD_POOL_SIZE} traders...")
     leaderboard_data = fetch_from_polymarket(
         f"{DATA_API}/v1/leaderboard",
@@ -231,7 +251,6 @@ def analyze_traders():
         sys.exit(1)
     print(f"✅ Retrieved {len(leaderboard_data)} traders.")
 
-    # Step 2 – screen by trade count
     print(f"\n🔍 Phase 1: screening {len(leaderboard_data)} traders ...")
     survivors = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -246,7 +265,6 @@ def analyze_traders():
         print("❌ No traders survived. Widen MIN/MAX_WEEKLY_TRADES.")
         sys.exit(1)
 
-    # Step 3 – compute win rates for survivors
     print(f"\n📊 Phase 2: calculating win rates for {len(survivors)} traders ...")
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -254,19 +272,11 @@ def analyze_traders():
         for future in as_completed(futures):
             results.append(future.result())
 
-    # Step 4 – build DataFrame
     df = pd.DataFrame(results)
-
-    # Combine early exits
     df["Early_Exits"] = df["Early_Exit_Wins"] + df["Early_Exit_Losses"]
-
-    # Combine Profit and Volume into one column
     df["Profit / Volume"] = df["Profit_$"].astype(str) + " / " + df["Volume_$"].astype(str)
-
-    # Filter out traders with too small sample
     df = df[df["Total_Sample"] >= MIN_SAMPLE_SIZE]
 
-    # Final columns (Confidence removed)
     final_columns = [
         "Wallet",
         "Name",
@@ -274,26 +284,25 @@ def analyze_traders():
         "Win_Rate_%",
         "Total_Sample",
         "Sample_Span_Days",
+        "Avg_Resolve_Age_Days",
+        "Recent_Resolves_7d",
         "Early_Exits",
         "Profit / Volume",
         "Profit_Rate"
     ]
     df = df[final_columns]
 
-    # Sort by Win Rate (highest first)
     df["_sort"] = pd.to_numeric(df["Win_Rate_%"], errors="coerce")
     df_sorted = df.sort_values("_sort", ascending=False, na_position="last").drop(columns="_sort")
 
-    # Save CSV
     date_str = datetime.now().strftime("%Y%m%d")
     filename = f"smart_money_{date_str}.csv"
     df_sorted.to_csv(filename, index=False)
 
-    # Print clean summary – only reliable traders
     print("\n" + "=" * 60)
     print(f"✅ Saved: {filename}  ({len(df_sorted)} traders with ≥{MIN_SAMPLE_SIZE} resolved trades)")
-    print("\n=== RELIABLE TRADERS (sorted by Win Rate) ===")
-    print(df_sorted[["Name", "Weekly_Trades", "Win_Rate_%", "Total_Sample", "Sample_Span_Days", "Profit / Volume", "Profit_Rate"]].to_string(index=False))
+    print("\n=== TRADERS (sorted by Win Rate) ===")
+    print(df_sorted[["Name", "Weekly_Trades", "Win_Rate_%", "Total_Sample", "Avg_Resolve_Age_Days", "Recent_Resolves_7d", "Profit_Rate"]].to_string(index=False))
     print("=" * 60)
     print("✅ Done.")
 
