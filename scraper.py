@@ -17,14 +17,14 @@ if not SCRAPER_API_KEY:
     sys.exit(1)
 
 # ── Trade count filter (weekly) ──────────────────────────────
-MIN_WEEKLY_TRADES = 20   # too few = not enough activity
-MAX_WEEKLY_TRADES = 500  # too many = bot, too risky for small wallet
+MIN_WEEKLY_TRADES = 10    # catch slower traders
+MAX_WEEKLY_TRADES = 1000  # include more active traders
 
 # ── Win rate sample size ──────────────────────────────────────
-WIN_RATE_LOOKBACK_PAGES = 10   # 10 pages × 50 = up to 500 resolved positions
-MIN_SAMPLE_SIZE = 20           # only show traders with at least this many resolved trades
+WIN_RATE_LOOKBACK_PAGES = 15   # up to 750 resolved positions
+MIN_SAMPLE_SIZE = 10           # only show traders with at least this many resolved trades
 
-LEADERBOARD_POOL_SIZE = 50     # you can lower to 20 for faster runs
+LEADERBOARD_POOL_SIZE = 100    # scan top 100 traders
 MAX_WORKERS = 5                # raise to 10 if your ScraperAPI plan allows
 
 # ============================================================
@@ -55,7 +55,7 @@ def fetch_from_polymarket(target_url, query_params=None):
         return None
 
 
-def count_weekly_trades(proxy_wallet, count_cap=600):
+def count_weekly_trades(proxy_wallet, count_cap=1100):  # increased cap
     total = 0
     offset = 0
     page_size = 500
@@ -263,7 +263,7 @@ def analyze_traders():
     # Combine Profit and Volume into one column
     df["Profit / Volume"] = df["Profit_$"].astype(str) + " / " + df["Volume_$"].astype(str)
 
-    # --- NEW: filter out traders with too small sample ---
+    # Filter out traders with too small sample
     df = df[df["Total_Sample"] >= MIN_SAMPLE_SIZE]
 
     # Final columns (Confidence removed)
