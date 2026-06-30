@@ -7,7 +7,7 @@ from urllib.parse import urlencode, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION – adjust these to your liking
 # ============================================================
 
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")
@@ -15,6 +15,17 @@ SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")
 if not SCRAPER_API_KEY:
     print("❌ Error: SCRAPER_API_KEY is missing from GitHub Secrets.")
     sys.exit(1)
+
+# ── Trade count filter (weekly) ──────────────────────────────
+MIN_WEEKLY_TRADES = 20   # too few = not enough activity
+MAX_WEEKLY_TRADES = 500  # too many = bot, too risky for small wallet
+
+# ── Win rate sample size ──────────────────────────────────────
+WIN_RATE_LOOKBACK_PAGES = 10   # 10 pages × 50 = up to 500 resolved positions
+MIN_SAMPLE_SIZE = 20           # only show traders with at least this many resolved trades
+
+LEADERBOARD_POOL_SIZE = 50     # you can lower to 20 for faster runs
+MAX_WORKERS = 5                # raise to 10 if your ScraperAPI plan allows
 
 # ============================================================
 # DO NOT CHANGE BELOW THIS LINE
@@ -24,14 +35,6 @@ DATA_API = "https://data-api.polymarket.com"
 
 NOW_TS      = int(datetime.now(timezone.utc).timestamp())
 WEEK_AGO_TS = NOW_TS - (7 * 24 * 60 * 60)
-
-MIN_WEEKLY_TRADES = 20
-MAX_WEEKLY_TRADES = 500
-
-LEADERBOARD_POOL_SIZE = 50          # reduce to 20 for faster runs
-WIN_RATE_LOOKBACK_PAGES  = 3        # increase to 5 for bigger samples
-MIN_SAMPLE_FOR_CONFIDENCE = 20
-MAX_WORKERS = 5                     # raise to 10 if ScraperAPI plan allows
 
 
 def fetch_from_polymarket(target_url, query_params=None):
@@ -190,15 +193,9 @@ def analyze_one_survivor(trader):
     username = trader["Name"]
     wr = fetch_recent_win_rate(wallet)
     win_rate_display = wr["win_rate"] if wr["win_rate"] is not None else "N/A"
-    if wr["total_sample"] == 0:
-        confidence = "NO DATA"
-    elif wr["total_sample"] < MIN_SAMPLE_FOR_CONFIDENCE:
-        confidence = "LOW (thin sample)"
-    else:
-        confidence = "OK"
     print(
         f"  {username:<20} Win Rate: {win_rate_display}% "
-        f"(sample {wr['total_sample']}, span {wr['sample_span_days']}d) | {confidence}"
+        f"(sample {wr['total_sample']}, span {wr['sample_span_days']}d)"
     )
     return {
         **trader,
@@ -210,7 +207,6 @@ def analyze_one_survivor(trader):
         "Early_Exit_Wins":    wr["early_exit_wins"],
         "Early_Exit_Losses":  wr["early_exit_losses"],
         "Pushes":             wr["pushes"],
-        "Confidence":         confidence,
         "Avg_Win_$":          wr["avg_win"],
         "Avg_Loss_$":         wr["avg_loss"],
     }
@@ -220,11 +216,11 @@ def analyze_traders():
     print("🚀 Starting Polymarket Smart Money Analyzer")
     print(f"   Weekly window: {datetime.utcfromtimestamp(WEEK_AGO_TS).strftime('%Y-%m-%d')} → {datetime.utcfromtimestamp(NOW_TS).strftime('%Y-%m-%d')}")
     print(f"   Trade filter: {MIN_WEEKLY_TRADES}–{MAX_WEEKLY_TRADES} trades/week")
-    print(f"   Win rate basis: most recent {WIN_RATE_LOOKBACK_PAGES*50} closed positions")
+    print(f"   Win rate basis: up to {WIN_RATE_LOOKBACK_PAGES*50} resolved positions (minimum sample {MIN_SAMPLE_SIZE})")
     print(f"   Parallel workers: {MAX_WORKERS}")
     print("=" * 60)
 
-    # Step 1 – fetch top 50 leaderboard
+    # Step 1 – fetch top leaderboard
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top {LEADERBOARD_POOL_SIZE} traders...")
     leaderboard_data = fetch_from_polymarket(
         f"{DATA_API}/v1/leaderboard",
@@ -235,7 +231,7 @@ def analyze_traders():
         sys.exit(1)
     print(f"✅ Retrieved {len(leaderboard_data)} traders.")
 
-    # Step 2 – screen by trade count (parallel)
+    # Step 2 – screen by trade count
     print(f"\n🔍 Phase 1: screening {len(leaderboard_data)} traders ...")
     survivors = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -250,7 +246,7 @@ def analyze_traders():
         print("❌ No traders survived. Widen MIN/MAX_WEEKLY_TRADES.")
         sys.exit(1)
 
-    # Step 3 – compute win rates for survivors (parallel)
+    # Step 3 – compute win rates for survivors
     print(f"\n📊 Phase 2: calculating win rates for {len(survivors)} traders ...")
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -258,7 +254,7 @@ def analyze_traders():
         for future in as_completed(futures):
             results.append(future.result())
 
-    # Step 4 – build final DataFrame
+    # Step 4 – build DataFrame
     df = pd.DataFrame(results)
 
     # Combine early exits
@@ -267,7 +263,10 @@ def analyze_traders():
     # Combine Profit and Volume into one column
     df["Profit / Volume"] = df["Profit_$"].astype(str) + " / " + df["Volume_$"].astype(str)
 
-    # Final columns (exactly what you asked for)
+    # --- NEW: filter out traders with too small sample ---
+    df = df[df["Total_Sample"] >= MIN_SAMPLE_SIZE]
+
+    # Final columns (Confidence removed)
     final_columns = [
         "Wallet",
         "Name",
@@ -275,7 +274,6 @@ def analyze_traders():
         "Win_Rate_%",
         "Total_Sample",
         "Sample_Span_Days",
-        "Confidence",
         "Early_Exits",
         "Profit / Volume",
         "Profit_Rate"
@@ -291,11 +289,11 @@ def analyze_traders():
     filename = f"smart_money_{date_str}.csv"
     df_sorted.to_csv(filename, index=False)
 
-    # Print clean summary – shows the combined column as well
+    # Print clean summary – only reliable traders
     print("\n" + "=" * 60)
-    print(f"✅ Saved: {filename}  ({len(df_sorted)} traders)")
-    print("\n=== TOP TRADERS (sorted by Win Rate) ===")
-    print(df_sorted[["Name", "Weekly_Trades", "Win_Rate_%", "Total_Sample", "Confidence", "Profit / Volume", "Profit_Rate"]].to_string(index=False))
+    print(f"✅ Saved: {filename}  ({len(df_sorted)} traders with ≥{MIN_SAMPLE_SIZE} resolved trades)")
+    print("\n=== RELIABLE TRADERS (sorted by Win Rate) ===")
+    print(df_sorted[["Name", "Weekly_Trades", "Win_Rate_%", "Total_Sample", "Sample_Span_Days", "Profit / Volume", "Profit_Rate"]].to_string(index=False))
     print("=" * 60)
     print("✅ Done.")
 
