@@ -27,11 +27,14 @@ NOW_TS      = int(datetime.now(timezone.utc).timestamp())
 WEEK_AGO_TS = NOW_TS - (7 * 24 * 60 * 60)
 
 # Hard caps so a single hyperactive trader can never blow up runtime/credits.
-# 300 weekly trades and 100 closed positions is already a LOT of signal —
-# anything beyond that doesn't meaningfully change a win-rate %.
-MAX_ACTIVITY_PAGES   = 1     # /activity:  1 page x 500 = up to 500 weekly trades counted
-ACTIVITY_PAGE_SIZE   = 500
-MAX_CLOSED_POSITIONS = 100   # /closed-positions: capped, sorted newest-first
+ACTIVITY_PAGE_SIZE        = 500   # /activity: max trades counted per week (Polymarket allows up to 500/page)
+
+# IMPORTANT: Polymarket's /closed-positions endpoint has a HARD MAXIMUM of 50
+# results per page (the API rejects/clamps anything higher). To get a real
+# sample for high-frequency traders we must paginate using `offset` instead
+# of asking for one giant page.
+CLOSED_POS_PAGE_SIZE      = 50    # API hard max — do not increase
+MAX_CLOSED_POS_PAGES      = 6     # 6 x 50 = up to 300 resolved positions checked per trader
 
 
 def fetch_from_polymarket(target_url, query_params=None):
@@ -100,65 +103,97 @@ def fetch_weekly_trade_count(proxy_wallet):
 
 def fetch_weekly_win_rate(proxy_wallet):
     """
-    Win rate from CLOSED (resolved) positions in the past 7 days.
+    Real win rate from positions that ACTUALLY RESOLVED in the past 7 days —
+    not positions the trader simply sold early.
 
-    Uses GET /closed-positions sorted by TIMESTAMP DESC (newest first),
-    capped at MAX_CLOSED_POSITIONS. Because results come back newest-first,
-    we can stop as soon as we see a position older than our 7-day window —
-    no need to fetch the trader's whole history.
+    Why this matters: Polymarket lets traders exit anytime by selling before
+    a market resolves. /closed-positions returns BOTH early-sell exits and
+    true market resolutions mixed together, with no boolean flag to tell
+    them apart. A trader who panic-sold a bad bet at a small loss looks
+    identical in the raw data to a trader who lost because the market
+    resolved against them — but those are very different risk signals for
+    copy-trading.
 
-    win  = realizedPnl > 0
-    loss = realizedPnl <= 0
-    win_rate = wins / (wins + losses) * 100
+    The fix: a market that has genuinely resolved settles outcome tokens at
+    EXACTLY $1.00 (won) or $0.00 (lost) — that's how Polymarket's oracle
+    redemption works. An early sell almost never lands on exactly 1.0 or 0.0
+    because it's exiting at whatever the live market price happens to be.
+    So we use curPrice to separate real resolutions from early exits:
 
-    If the trader has zero closed positions in the window (e.g. everything
-    they hold is still open / unresolved), we return None so the caller can
-    report "N/A" instead of a misleading 0%.
+        curPrice == 1.0  →  market resolved YES, position WON  (real result)
+        curPrice == 0.0  →  market resolved NO,  position LOST (real result)
+        anything else    →  trader sold early — EXCLUDED from win rate,
+                             since it's not a real win/loss outcome yet
+
+    win_rate = real_wins / (real_wins + real_losses) * 100
+
+    Returns: (win_rate <float or None>, real_resolved_count <int>,
+              early_exit_count <int>)
     """
-    data = fetch_from_polymarket(
-        f"{DATA_API}/closed-positions",
-        query_params={
-            "user":          proxy_wallet,
-            "limit":         MAX_CLOSED_POSITIONS,
-            "sortBy":        "TIMESTAMP",
-            "sortDirection": "DESC",
-        }
-    )
+    real_wins = real_losses = 0
+    early_exits = 0
 
-    if not data or not isinstance(data, list):
-        return None, 0
+    for page in range(MAX_CLOSED_POS_PAGES):
+        offset = page * CLOSED_POS_PAGE_SIZE
 
-    wins = losses = 0
+        data = fetch_from_polymarket(
+            f"{DATA_API}/closed-positions",
+            query_params={
+                "user":          proxy_wallet,
+                "limit":         CLOSED_POS_PAGE_SIZE,
+                "offset":        offset,
+                "sortBy":        "TIMESTAMP",
+                "sortDirection": "DESC",
+            }
+        )
 
-    for pos in data:
-        ts = pos.get("timestamp")
-        if ts is None:
-            continue
-
-        # Results are newest-first: once we hit something older than our
-        # window, every position after it is also older — stop counting.
-        if ts < WEEK_AGO_TS:
+        if not data or not isinstance(data, list) or len(data) == 0:
             break
 
-        realized_pnl = pos.get("realizedPnl")
-        if realized_pnl is None:
-            continue
+        window_closed = False
 
-        try:
-            pnl_val = float(realized_pnl)
-        except (TypeError, ValueError):
-            continue
+        for pos in data:
+            ts = pos.get("timestamp")
+            if ts is None:
+                continue
 
-        if pnl_val > 0:
-            wins += 1
-        else:
-            losses += 1
+            if ts < WEEK_AGO_TS:
+                window_closed = True
+                break
 
-    total = wins + losses
-    if total == 0:
-        return None, 0
+            cur_price = pos.get("curPrice")
+            if cur_price is None:
+                continue
 
-    return round((wins / total) * 100, 1), total
+            try:
+                price_val = float(cur_price)
+            except (TypeError, ValueError):
+                continue
+
+            # Only count GENUINE resolutions — exact 1.0 or 0.0 settlement.
+            # A small float tolerance handles any rounding from the API.
+            if price_val >= 0.999:
+                real_wins += 1
+            elif price_val <= 0.001:
+                real_losses += 1
+            else:
+                # Sold early at some in-between price — not a real
+                # win/loss outcome, so we exclude it from the win rate.
+                early_exits += 1
+
+        if window_closed:
+            break
+
+        if len(data) < CLOSED_POS_PAGE_SIZE:
+            break
+
+        time.sleep(0.25)
+
+    total_resolved = real_wins + real_losses
+    if total_resolved == 0:
+        return None, 0, early_exits
+
+    return round((real_wins / total_resolved) * 100, 1), total_resolved, early_exits
 
 
 def analyze_traders():
@@ -204,27 +239,40 @@ def analyze_traders():
         weekly_trades, hit_cap = fetch_weekly_trade_count(wallet)
         time.sleep(0.3)
 
-        print(f"  [{idx+1}/10] {username} | calculating weekly win rate...")
-        win_rate, sample_size = fetch_weekly_win_rate(wallet)
+        print(f"  [{idx+1}/10] {username} | calculating real win rate...")
+        win_rate, resolved_count, early_exits = fetch_weekly_win_rate(wallet)
         time.sleep(0.3)
 
         trades_display = f"{weekly_trades}+" if hit_cap else str(weekly_trades)
         win_rate_display = win_rate if win_rate is not None else "N/A"
 
+        # Flag thin samples so you never mistake a lucky streak for a track
+        # record. 20+ genuinely RESOLVED trades is a reasonable minimum
+        # before a win rate % is trustworthy enough for a copy-trade call.
+        if resolved_count == 0:
+            confidence = "NO DATA"
+        elif resolved_count < 20:
+            confidence = "LOW (thin sample)"
+        else:
+            confidence = "OK"
+
         results.append({
-            "Wallet":          wallet,
-            "Name":            username,
-            "Weekly_Trades":   trades_display,
-            "Win_Rate_%":      win_rate_display,
-            "Win_Sample_Size": sample_size,   # how many resolved trades the % is based on
-            "Profit_$":        round(pnl, 2),
-            "Volume_$":        round(volume, 2),
-            "Profit_Rate":     profit_rate,
+            "Wallet":            wallet,
+            "Name":              username,
+            "Weekly_Trades":     trades_display,
+            "Win_Rate_%":        win_rate_display,   # real wins / real losses only
+            "Resolved_Trades":   resolved_count,     # markets that ACTUALLY settled this week
+            "Early_Exits":       early_exits,         # sold before resolution — excluded from win rate
+            "Confidence":        confidence,
+            "Profit_$":          round(pnl, 2),
+            "Volume_$":          round(volume, 2),
+            "Profit_Rate":       profit_rate,
         })
 
         print(
             f"         ✅ Weekly trades: {trades_display} | "
-            f"Win Rate: {win_rate_display}% (n={sample_size}) | Profit: ${pnl:,.0f}"
+            f"Win Rate: {win_rate_display}% (resolved n={resolved_count}, early exits={early_exits}) | "
+            f"Profit: ${pnl:,.0f}"
         )
 
     if not results:
@@ -246,7 +294,7 @@ def analyze_traders():
     print(f"   Window: past 7 days  |  Run date: {date_str}")
     print("\n=== TOP 10 TRADERS (sorted by Win Rate) ===")
     print(
-        df_sorted[["Name", "Weekly_Trades", "Win_Rate_%", "Win_Sample_Size", "Profit_$", "Profit_Rate"]]
+        df_sorted[["Name", "Weekly_Trades", "Win_Rate_%", "Resolved_Trades", "Early_Exits", "Confidence", "Profit_$", "Profit_Rate"]]
         .to_string(index=False)
     )
     print("=" * 60)
