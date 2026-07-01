@@ -27,11 +27,11 @@ LEADERBOARD_POOL   = 100     # screen the top 100 by weekly PNL
 TOP_N_OUTPUT       = 10      # show only the best 10 in the final list
 # Polymarket's /closed-positions hard-caps at 50 per page
 CLOSED_PAGE_SIZE   = 50
-CLOSED_PAGES       = 3       # 3x50 = up to 150 recent resolved positions
+CLOSED_PAGES       = 6       # 6x50 = up to 300 recent resolved positions
 MIN_SAMPLE         = 40      # need at least this many to trust a win rate
 MIN_LOSSES         = 3       # must have at least 3 losses — catches 100% WR survivorship bias
 # How many BUY activity records to fetch for hold-time matching
-ACTIVITY_PAGES     = 3       # 3x500 = up to 1500 recent BUY trades
+ACTIVITY_PAGES     = 5       # 5x500 = up to 2500 recent BUY trades
 MAX_WORKERS        = 5       # parallel threads — keeps runtime fast
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "polymarket-analyzer/1.0"})
@@ -297,7 +297,7 @@ def main():
         (df["_rr_num"] >= MIN_RISK_REWARD) &
         (df["_mkt_num"] >= MIN_MARKETS) &
         (df["_span_num"] >= MIN_SPAN_DAYS) &
-        ((df["_hold_num"] <= MAX_AVG_HOLD_DAYS) | (df["_hold_num"].isna())) &
+        (df["_hold_num"].notna() & (df["_hold_num"] <= MAX_AVG_HOLD_DAYS)) &
         (df["Total_Losses"] >= MIN_LOSSES)
     ].copy()
     qualified["Score"] = qualified.apply(compute_score, axis=1)
