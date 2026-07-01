@@ -254,12 +254,21 @@ def main():
           f"Recency weighting | Market diversity | Risk-reward")
     print(f"   No API key needed - direct Polymarket API, completely free")
     print("=" * 70)
-    # Step 1: leaderboard
+    # Step 1: leaderboard (API caps at 50 per page, paginate to reach LEADERBOARD_POOL)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top {LEADERBOARD_POOL} traders...")
-    lb = get("/v1/leaderboard", {
-        "timePeriod": "WEEK", "orderBy": "PNL", "limit": LEADERBOARD_POOL
-    })
-    if not lb or not isinstance(lb, list):
+    lb = []
+    page_size = 50
+    for offset in range(0, LEADERBOARD_POOL, page_size):
+        limit = min(page_size, LEADERBOARD_POOL - offset)
+        page = get("/v1/leaderboard", {
+            "timePeriod": "WEEK", "orderBy": "PNL", "limit": limit, "offset": offset
+        })
+        if not page or not isinstance(page, list):
+            break
+        lb.extend(page)
+        if len(page) < page_size:
+            break
+    if not lb:
         print("Failed to fetch leaderboard.")
         sys.exit(1)
     print(f"{len(lb)} traders retrieved.\n")
