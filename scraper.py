@@ -23,12 +23,13 @@ MIN_SPAN_DAYS      = 3       # need at least 3 days of trading history
 MIN_RISK_REWARD    = 0.5     # avg_win must be at least half of avg_loss (floor)
 MIN_MARKETS        = 3       # must trade across at least 3 distinct markets
 MAX_AVG_HOLD_DAYS  = 2.0     # day-traders only: avg hold <= 2 days
-LEADERBOARD_POOL   = 50      # screen the top 50 by weekly PNL
+LEADERBOARD_POOL   = 100     # screen the top 100 by weekly PNL
 TOP_N_OUTPUT       = 10      # show only the best 10 in the final list
 # Polymarket's /closed-positions hard-caps at 50 per page
 CLOSED_PAGE_SIZE   = 50
 CLOSED_PAGES       = 3       # 3x50 = up to 150 recent resolved positions
 MIN_SAMPLE         = 40      # need at least this many to trust a win rate
+MIN_LOSSES         = 3       # must have at least 3 losses — catches 100% WR survivorship bias
 # How many BUY activity records to fetch for hold-time matching
 ACTIVITY_PAGES     = 3       # 3x500 = up to 1500 recent BUY trades
 MAX_WORKERS        = 5       # parallel threads — keeps runtime fast
@@ -223,6 +224,7 @@ def analyze(trader):
           f"RR={rr_ratio} [{confidence}]")
     resolved_str = f"{wr['resolved_wins']}W/{wr['resolved_losses']}L"
     early_str    = f"{wr['early_exit_wins']}W/{wr['early_exit_losses']}L"
+    total_losses = wr["resolved_losses"] + wr["early_exit_losses"]
     return {
         **trader,
         "Win_Rate_%":         wr_val if wr_val is not None else "N/A",
@@ -231,6 +233,7 @@ def analyze(trader):
         "Sample_Span_Days":   wr["span_days"],
         "Resolved":           resolved_str,
         "Early_Exit":         early_str,
+        "Total_Losses":       total_losses,
         "Pushes":             wr["pushes"],
         "Avg_Win_$":          wr["avg_win"],
         "Avg_Loss_$":         wr["avg_loss"],
@@ -294,7 +297,8 @@ def main():
         (df["_rr_num"] >= MIN_RISK_REWARD) &
         (df["_mkt_num"] >= MIN_MARKETS) &
         (df["_span_num"] >= MIN_SPAN_DAYS) &
-        (df["_hold_num"] <= MAX_AVG_HOLD_DAYS)
+        ((df["_hold_num"] <= MAX_AVG_HOLD_DAYS) | (df["_hold_num"].isna())) &
+        (df["Total_Losses"] >= MIN_LOSSES)
     ].copy()
     qualified["Score"] = qualified.apply(compute_score, axis=1)
     qualified = (qualified
