@@ -6,41 +6,32 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-
 # ============================================================
 # NO API KEY NEEDED
 # Polymarket's Data API is fully public and free.
 # No ScraperAPI, no proxy, no secrets required.
 # ============================================================
-
 DATA_API = "https://data-api.polymarket.com"
-
 NOW_TS      = int(datetime.now(timezone.utc).timestamp())
 WEEK_AGO_TS = NOW_TS - (7 * 24 * 60 * 60)
-
 # ── Filters ────────────────────────────────────────────────────
 MIN_WEEKLY_TRADES = 20      # too few = can't trust the win rate
 MAX_WEEKLY_TRADES = 500     # too many = bot, not safe on a small balance
 MIN_WIN_RATE      = 60.0    # % — must win majority of trades
 MIN_PROFIT_RATE   = 0.10    # must make at least 10c profit per $1 volume
-
+MIN_SPAN_DAYS     = 3       # need at least 3 days of trading history
+MIN_RISK_REWARD   = 0.5     # avg_win must be at least half of avg_loss (floor)
+MIN_MARKETS       = 3       # must trade across at least 3 distinct markets
 LEADERBOARD_POOL  = 50      # screen the top 50 by weekly PNL
 TOP_N_OUTPUT      = 10      # show only the best 10 in the final list
-
 # Polymarket's /closed-positions hard-caps at 50 per page
 CLOSED_PAGE_SIZE  = 50
 CLOSED_PAGES      = 3       # 3×50 = up to 150 recent resolved positions
-
-MIN_SAMPLE        = 20      # need at least this many to trust a win rate
-
+MIN_SAMPLE        = 40      # need at least this many to trust a win rate
 MAX_WORKERS       = 5       # parallel threads — keeps runtime fast
-
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "polymarket-analyzer/1.0"})
-
-
 # ── API helper ─────────────────────────────────────────────────
-
 def get(path, params=None, retries=3):
     """
     Direct GET to Polymarket's Data API — no proxy, no key, completely free.
@@ -60,10 +51,7 @@ def get(path, params=None, retries=3):
             else:
                 print(f"    ⚠️  {url} failed: {e}")
     return None
-
-
 # ── Phase 1: weekly trade count (cheap) ────────────────────────
-
 def weekly_trade_count(wallet, cap=MAX_WEEKLY_TRADES + 100):
     """
     Count BUY trades placed in the past 7 days.
@@ -84,33 +72,33 @@ def weekly_trade_count(wallet, cap=MAX_WEEKLY_TRADES + 100):
             break
         offset += 500
     return total
-
-
-# ── Phase 2: win rate (only for survivors) ─────────────────────
-
+# ── Phase 2: win rate + market diversity (only for survivors) ──
 def recent_win_rate(wallet):
     """
     Win rate from the most recent ~150 closed positions.
-
     NOT limited to 7 days — markets take days/weeks to resolve, so a strict
     7-day window produces tiny, untrustworthy samples. Instead we look at
     the most recent resolved positions however far back they naturally go,
     and report Sample_Span_Days so you can judge recency yourself.
-
     Resolution detection via curPrice:
       1.0  → market resolved YES  → WIN  (real outcome)
       0.0  → market resolved NO   → LOSS (real outcome)
       ~0.5 → ambiguous push       → excluded
       else → sold early           → counted by realizedPnl (profitable
-                                    exit = win, losing exit = loss) but
-                                    tracked separately so you can see the
-                                    breakdown in the CSV
+                                    exit = win, losing exit = loss) —
+                                    EARLY EXIT trades are kept and labeled
+                                    separately so you can see the breakdown.
+    Also tracks distinct markets and recency-weighted win rate.
     """
     r_wins = r_losses = ee_wins = ee_losses = pushes = 0
     win_pnl = []
     loss_pnl = []
     oldest_ts = None
-
+    markets_seen = set()
+    # For recency weighting: trades in last 3 days count 2x
+    three_days_ago = NOW_TS - (3 * 24 * 60 * 60)
+    weighted_wins = 0.0
+    weighted_total = 0.0
     for page in range(CLOSED_PAGES):
         data = get("/closed-positions", {
             "user": wallet,
@@ -121,11 +109,11 @@ def recent_win_rate(wallet):
         })
         if not data or not isinstance(data, list):
             break
-
         for pos in data:
             ts    = pos.get("timestamp")
             cp    = pos.get("curPrice")
             pnl   = pos.get("realizedPnl")
+            mkt   = pos.get("market") or pos.get("conditionId") or pos.get("marketSlug")
             if cp is None:
                 continue
             try:
@@ -133,31 +121,39 @@ def recent_win_rate(wallet):
                 pnl_f = float(pnl) if pnl is not None else 0.0
             except (TypeError, ValueError):
                 continue
-
             if ts and (oldest_ts is None or ts < oldest_ts):
                 oldest_ts = ts
-
+            if mkt:
+                markets_seen.add(mkt)
+            # Recency weight: 2x for trades in last 3 days, 1x otherwise
+            weight = 2.0 if (ts and ts >= three_days_ago) else 1.0
             if cp_f >= 0.999:
                 r_wins += 1; win_pnl.append(pnl_f)
+                weighted_wins += weight
+                weighted_total += weight
             elif cp_f <= 0.001:
                 r_losses += 1; loss_pnl.append(pnl_f)
+                weighted_total += weight
             elif 0.499 <= cp_f <= 0.501:
                 pushes += 1
             else:
+                # EARLY EXIT: sold before resolution — real trade, kept & labeled
                 if pnl_f > 0:
                     ee_wins += 1; win_pnl.append(pnl_f)
+                    weighted_wins += weight
                 else:
                     ee_losses += 1; loss_pnl.append(pnl_f)
-
+                weighted_total += weight
         if len(data) < CLOSED_PAGE_SIZE:
             break
-
     total_w = r_wins + ee_wins
     total_l = r_losses + ee_losses
     total   = total_w + total_l
-
+    # Recency-weighted win rate: recent trades count more
+    recency_wr = round(weighted_wins / weighted_total * 100, 1) if weighted_total else None
     return {
         "win_rate":         round(total_w / total * 100, 1) if total else None,
+        "recency_wr":       recency_wr,
         "sample":           total,
         "resolved_wins":    r_wins,
         "resolved_losses":  r_losses,
@@ -167,11 +163,30 @@ def recent_win_rate(wallet):
         "avg_win":          round(sum(win_pnl) / len(win_pnl), 2) if win_pnl else 0.0,
         "avg_loss":         round(sum(loss_pnl) / len(loss_pnl), 2) if loss_pnl else 0.0,
         "span_days":        round((NOW_TS - oldest_ts) / 86400, 1) if oldest_ts else None,
+        "markets_traded":   len(markets_seen),
     }
-
-
+# ── Composite ranking score ────────────────────────────────────
+def compute_score(row):
+    """
+    Composite score combining multiple signals.
+    Higher = better candidate for copy-trading.
+    Components (weights sum to 1.0):
+      30% — recency-weighted win rate (recent performance matters more)
+      25% — profit rate (how much profit per $ volume)
+      20% — sample confidence (more data = more trustworthy)
+      15% — risk-reward ratio (are wins bigger than losses?)
+      10% — market diversity (trades across many markets, not one lucky pick)
+    """
+    wr  = (row.get("Recency_WR") or 0) / 100       # 0.6–1.0
+    pr  = min(row.get("Profit_Rate", 0), 1.0)       # cap at 1.0
+    n   = min(row.get("Sample", 0), 200) / 200       # confidence, capped at 200
+    avg_w = row.get("Avg_Win_$", 0)
+    avg_l = abs(row.get("Avg_Loss_$", 0)) or 0.01
+    rr  = min(avg_w / avg_l, 5.0) / 5.0             # risk-reward, capped at 5
+    mkts = min(row.get("Markets_Traded", 0), 15) / 15  # diversity, capped at 15
+    score = (0.30 * wr) + (0.25 * pr) + (0.20 * n) + (0.15 * rr) + (0.10 * mkts)
+    return round(score, 4)
 # ── Worker functions (run in threads) ─────────────────────────
-
 def screen(entry):
     """Phase 1 worker: check trade count, return basic dict or None."""
     wallet = entry.get("proxyWallet")
@@ -181,15 +196,12 @@ def screen(entry):
     volume = float(entry.get("vol", 0))
     if volume <= 0:
         return None
-
     trades = weekly_trade_count(wallet)
     in_band = MIN_WEEKLY_TRADES <= trades <= MAX_WEEKLY_TRADES
     print(f"  {'✅' if in_band else '❌'} "
           f"{entry.get('userName', wallet[:8]):<20} {trades:>4} trades/wk")
-
     if not in_band:
         return None
-
     return {
         "Wallet":        wallet,
         "Name":          entry.get("userName") or entry.get("xUsername") or wallet[:8] + "...",
@@ -198,24 +210,22 @@ def screen(entry):
         "Volume_$":      round(volume, 2),
         "Profit_Rate":   round(pnl / volume, 4),
     }
-
-
 def analyze(trader):
-    """Phase 2 worker: calculate win rate for one survivor."""
+    """Phase 2 worker: calculate win rate + market diversity for one survivor."""
     wr = recent_win_rate(trader["Wallet"])
     wr_val = wr["win_rate"]
-
     confidence = ("NO DATA" if wr["sample"] == 0
                   else "LOW" if wr["sample"] < MIN_SAMPLE
                   else "OK")
-
+    rr_ratio = round(wr["avg_win"] / max(abs(wr["avg_loss"]), 0.01), 2) if wr["avg_loss"] != 0 else "N/A"
     print(f"  {'✅' if wr_val and wr_val >= MIN_WIN_RATE else '  '} "
           f"{trader['Name']:<20} WR={wr_val}% "
-          f"(n={wr['sample']}, span={wr['span_days']}d) [{confidence}]")
-
+          f"(n={wr['sample']}, span={wr['span_days']}d, mkts={wr['markets_traded']}) "
+          f"RR={rr_ratio} [{confidence}]")
     return {
         **trader,
         "Win_Rate_%":         wr_val if wr_val is not None else "N/A",
+        "Recency_WR":         wr["recency_wr"],
         "Sample":             wr["sample"],
         "Sample_Span_Days":   wr["span_days"],
         "Resolved_W":         wr["resolved_wins"],
@@ -225,20 +235,19 @@ def analyze(trader):
         "Pushes":             wr["pushes"],
         "Avg_Win_$":          wr["avg_win"],
         "Avg_Loss_$":         wr["avg_loss"],
+        "Risk_Reward":        rr_ratio,
+        "Markets_Traded":     wr["markets_traded"],
         "Confidence":         confidence,
     }
-
-
 # ── Main ───────────────────────────────────────────────────────
-
 def main():
     t0 = time.time()
-    print("🚀 Polymarket Smart Money Analyzer")
+    print("🚀 Polymarket Smart Money Analyzer v2")
     print(f"   Filters: {MIN_WEEKLY_TRADES}–{MAX_WEEKLY_TRADES} trades/wk | "
-          f"Win Rate ≥{MIN_WIN_RATE}% | Profit Rate ≥{MIN_PROFIT_RATE}")
+          f"WR ≥{MIN_WIN_RATE}% | PR ≥{MIN_PROFIT_RATE}")
+    print(f"   New: composite scoring, recency weighting, market diversity, risk-reward")
     print(f"   No API key needed — direct Polymarket API, completely free")
-    print("=" * 60)
-
+    print("=" * 70)
     # ── Step 1: leaderboard ──────────────────────────────────────
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top {LEADERBOARD_POOL} traders...")
     lb = get("/v1/leaderboard", {
@@ -248,7 +257,6 @@ def main():
         print("❌ Failed to fetch leaderboard.")
         sys.exit(1)
     print(f"✅ {len(lb)} traders retrieved.\n")
-
     # ── Step 2: Phase 1 — parallel trade-count screening ─────────
     print(f"🔍 PHASE 1: trade-count screen ({MAX_WORKERS} parallel)...")
     survivors = []
@@ -257,75 +265,80 @@ def main():
             r = result.result()
             if r:
                 survivors.append(r)
-
     print(f"\n✅ {len(survivors)}/{len(lb)} passed trade-count filter "
           f"({MIN_WEEKLY_TRADES}–{MAX_WEEKLY_TRADES}/wk).\n")
-
     if not survivors:
         print("❌ No survivors. Widen MIN/MAX_WEEKLY_TRADES and retry.")
         sys.exit(1)
-
-    # ── Step 3: Phase 2 — parallel win-rate analysis ──────────────
-    print(f"📊 PHASE 2: win-rate analysis ({MAX_WORKERS} parallel)...")
+    # ── Step 3: Phase 2 — parallel win-rate + diversity analysis ─
+    print(f"📊 PHASE 2: win-rate + market diversity analysis ({MAX_WORKERS} parallel)...")
     enriched = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for result in as_completed([ex.submit(analyze, t) for t in survivors]):
             enriched.append(result.result())
-
     # ── Step 4: apply quality filters ─────────────────────────────
     df = pd.DataFrame(enriched)
-    df["_wr_num"] = pd.to_numeric(df["Win_Rate_%"], errors="coerce")
-
+    df["_wr_num"]  = pd.to_numeric(df["Win_Rate_%"], errors="coerce")
+    df["_rec_wr"]  = pd.to_numeric(df["Recency_WR"], errors="coerce")
+    df["_rr_num"]  = pd.to_numeric(df["Risk_Reward"], errors="coerce")
+    df["_mkt_num"] = pd.to_numeric(df["Markets_Traded"], errors="coerce")
+    df["_span_num"] = pd.to_numeric(df["Sample_Span_Days"], errors="coerce")
     qualified = df[
         (df["_wr_num"] >= MIN_WIN_RATE) &
         (df["Profit_Rate"] >= MIN_PROFIT_RATE) &
-        (df["Confidence"] != "NO DATA")
+        (df["Confidence"] != "NO DATA") &
+        (df["_rr_num"] >= MIN_RISK_REWARD) &
+        (df["_mkt_num"] >= MIN_MARKETS) &
+        (df["_span_num"] >= MIN_SPAN_DAYS)
     ].copy()
-
+    # Compute composite score for ranking
+    qualified["Score"] = qualified.apply(compute_score, axis=1)
     qualified = (qualified
-                 .sort_values("_wr_num", ascending=False)
+                 .sort_values("Score", ascending=False)
                  .head(TOP_N_OUTPUT)
-                 .drop(columns="_wr_num"))
-
-    df = df.drop(columns="_wr_num")
-
+                 .drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num"]))
+    df = df.drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num"])
     # ── Step 5: save ───────────────────────────────────────────────
     date_str  = datetime.now().strftime("%Y%m%d")
     full_file = f"smart_money_{date_str}.csv"
     best_file = f"best_traders_{date_str}.csv"
-
     col_order = [
-        "Wallet", "Name", "Weekly_Trades", "Win_Rate_%", "Sample",
-        "Sample_Span_Days", "Resolved_W", "Resolved_L",
+        "Wallet", "Name", "Score", "Weekly_Trades", "Win_Rate_%", "Recency_WR",
+        "Sample", "Sample_Span_Days", "Resolved_W", "Resolved_L",
         "Early_Exit_W", "Early_Exit_L", "Pushes", "Confidence",
-        "Avg_Win_$", "Avg_Loss_$", "Profit_$", "Volume_$", "Profit_Rate"
+        "Avg_Win_$", "Avg_Loss_$", "Risk_Reward", "Markets_Traded",
+        "Profit_$", "Volume_$", "Profit_Rate"
     ]
-    df_sorted = (df.assign(_wr_num=pd.to_numeric(df["Win_Rate_%"], errors="coerce"))
-                   .sort_values("_wr_num", ascending=False)
-                   .drop(columns="_wr_num"))
-    df_sorted[col_order].to_csv(full_file, index=False)
-
-    # Best traders: simple 3-column shortlist for quick copy-trade decisions
+    # Add score to full dataframe for sorting (only for rows that qualify)
+    df["_score"] = df.apply(
+        lambda r: compute_score(r) if r.get("Confidence") == "OK" else 0, axis=1
+    )
+    df_sorted = df.sort_values("_score", ascending=False).drop(columns="_score")
+    # Reorder columns that exist
+    existing_cols = [c for c in col_order if c in df_sorted.columns]
+    df_sorted[existing_cols].to_csv(full_file, index=False)
+    # Best traders: shortlist for quick copy-trade decisions
     if not qualified.empty:
-        qualified[["Name", "Win_Rate_%", "Profit_Rate", "Wallet"]].to_csv(best_file, index=False)
-
+        best_cols = ["Name", "Win_Rate_%", "Recency_WR", "Profit_Rate",
+                     "Risk_Reward", "Markets_Traded", "Score", "Wallet"]
+        qualified[best_cols].to_csv(best_file, index=False)
     elapsed = round(time.time() - t0, 1)
-
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print(f"✅ Done in {elapsed}s")
     print(f"   Full data  → {full_file}  ({len(df_sorted)} traders)")
     print(f"   Shortlist  → {best_file}  ({len(qualified)} traders)")
-
-    print(f"\n{'=' * 60}")
+    print(f"\n{'=' * 70}")
     if qualified.empty:
         print("⚠️  No traders met all filters today.")
         print("   Tip: check full CSV — you may want to loosen MIN_WIN_RATE or MIN_PROFIT_RATE.")
     else:
         print(f"🏆 TOP {len(qualified)} TRADERS TO COPY-TRADE TODAY")
-        print(f"   (Win Rate ≥{MIN_WIN_RATE}% AND Profit Rate ≥{MIN_PROFIT_RATE})\n")
-        print(qualified[["Name", "Win_Rate_%", "Profit_Rate"]].to_string(index=False))
-    print("=" * 60)
-
-
+        print(f"   Filters: WR ≥{MIN_WIN_RATE}% | PR ≥{MIN_PROFIT_RATE} | "
+              f"RR ≥{MIN_RISK_REWARD} | Mkts ≥{MIN_MARKETS} | Span ≥{MIN_SPAN_DAYS}d\n")
+        display = qualified[["Name", "Win_Rate_%", "Recency_WR", "Profit_Rate",
+                             "Risk_Reward", "Markets_Traded", "Score"]].copy()
+        display.columns = ["Name", "Win%", "Recent_WR", "ProfRate", "RR", "Mkts", "Score"]
+        print(display.to_string(index=False))
+    print("=" * 70)
 if __name__ == "__main__":
     main()
