@@ -2,8 +2,8 @@ name: Daily Polymarket Analyzer
 
 on:
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 0 * * *'   # runs daily at midnight UTC
+  workflow_dispatch:      # allows manual trigger from GitHub UI
 
 jobs:
   build:
@@ -23,10 +23,7 @@ jobs:
         pip install -r requirements.txt
 
     - name: Run scraper
-      env:
-        SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
-      run: |
-        python scraper.py
+      run: python scraper.py
 
     - name: Upload results
       uses: actions/upload-artifact@v4
