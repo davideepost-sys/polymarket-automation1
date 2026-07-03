@@ -23,7 +23,7 @@ MIN_SPAN_DAYS      = 3       # need at least 3 days of trading history
 MIN_RISK_REWARD    = 0.5     # avg_win must be at least half of avg_loss (floor)
 MIN_MARKETS        = 3       # must trade across at least 3 distinct markets
 MAX_AVG_HOLD_DAYS  = 2.0     # day-traders only: avg hold <= 2 days
-LEADERBOARD_POOL   = 100     # screen the top 100 by weekly PNL
+LEADERBOARD_POOL   = 150     # screen the top 150 by weekly PNL
 TOP_N_OUTPUT       = 10      # show only the best 10 in the final list
 # Polymarket's /closed-positions hard-caps at 50 per page
 CLOSED_PAGE_SIZE   = 50
