@@ -23,7 +23,7 @@ MIN_SPAN_DAYS      = 3       # need at least 3 days of trading history
 MIN_RISK_REWARD    = 0.5     # avg_win must be at least half of avg_loss (floor)
 MIN_MARKETS        = 3       # must trade across at least 3 distinct markets
 MAX_AVG_HOLD_DAYS  = 2.0     # day-traders only: avg hold <= 2 days
-LEADERBOARD_POOL   = 150     # screen the top 150 by weekly PNL
+LEADERBOARD_POOL   = 200     # screen the top 200 by weekly PNL
 TOP_N_OUTPUT       = 10      # show only the best 10 in the final list
 # Polymarket's /closed-positions hard-caps at 50 per page
 CLOSED_PAGE_SIZE   = 50
@@ -330,8 +330,15 @@ def main():
         lambda r: compute_score(r) if r.get("Confidence") == "OK" else 0, axis=1
     )
     df_sorted = df.sort_values("_score", ascending=False).drop(columns="_score")
+    # Only save traders that passed all filters
     existing_cols = [c for c in col_order if c in df_sorted.columns]
-    df_sorted[existing_cols].to_csv(full_file, index=False)
+    if not qualified.empty:
+        q_wallets = set(qualified["Wallet"])
+        df_passed = df_sorted[df_sorted["Wallet"].isin(q_wallets)]
+        df_passed[existing_cols].to_csv(full_file, index=False)
+    else:
+        df_passed = df_sorted.iloc[0:0]
+        df_passed[existing_cols].to_csv(full_file, index=False)
     if not qualified.empty:
         best_cols = ["Name", "Win_Rate_%", "Recency_WR", "Profit_Rate",
                      "Risk_Reward", "Avg_Hold_Days", "Markets_Traded",
@@ -340,7 +347,7 @@ def main():
     elapsed = round(time.time() - t0, 1)
     print("\n" + "=" * 70)
     print(f"Done in {elapsed}s")
-    print(f"   Full data  -> {full_file}  ({len(df_sorted)} traders)")
+    print(f"   Full data  -> {full_file}  ({len(df_passed)} traders)")
     print(f"   Shortlist  -> {best_file}  ({len(qualified)} traders)")
     print(f"\n{'=' * 70}")
     if qualified.empty:
