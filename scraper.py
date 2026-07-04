@@ -23,7 +23,7 @@ MIN_SPAN_DAYS      = 3       # need at least 3 days of trading history
 MIN_RISK_REWARD    = 0.5     # avg_win must be at least half of avg_loss (floor)
 MIN_MARKETS        = 3       # must trade across at least 3 distinct markets
 MAX_AVG_HOLD_DAYS  = 2.0     # day-traders only: avg hold <= 2 days
-LEADERBOARD_POOL   = 200     # screen the top 200 by weekly PNL
+LEADERBOARD_POOL   = 500     # screen the top 500 by weekly PNL
 TOP_N_OUTPUT       = 10      # show only the best 10 in the final list
 # Polymarket's /closed-positions hard-caps at 50 per page
 CLOSED_PAGE_SIZE   = 50
@@ -316,9 +316,9 @@ def main():
                  .drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num", "_hold_num"]))
     df = df.drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num", "_hold_num"])
     # Step 5: save
-    date_str  = datetime.now().strftime("%Y%m%d")
-    full_file = f"smart_money_{date_str}.csv"
-    best_file = f"best_traders_{date_str}.csv"
+    timestamp_str  = datetime.now().strftime("%Y%m%d-%H%M")
+    full_file = f"smart_money_{timestamp_str}.csv"
+    best_file = f"best_traders_{timestamp_str}.csv"
     col_order = [
         "Wallet", "Name", "Score", "Weekly_Trades", "Win_Rate_%", "Recency_WR",
         "Sample", "Sample_Span_Days", "Resolved", "Early_Exit", "Pushes",
