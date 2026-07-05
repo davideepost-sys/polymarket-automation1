@@ -25,7 +25,6 @@ MIN_RISK_REWARD    = 0.5     # avg_win must be at least half of avg_loss (floor)
 MIN_MARKETS        = 3       # must trade across at least 3 distinct markets
 MAX_AVG_HOLD_DAYS  = 2.0     # day-traders only: avg hold <= 2 days
 LEADERBOARD_POOL   = 1000    # screen the top 1000 by weekly PNL
-TOP_N_OUTPUT       = 10      # show only the best 10 in the final list
 # Polymarket's /closed-positions hard-caps at 50 per page
 CLOSED_PAGE_SIZE   = 50
 CLOSED_PAGES       = 6       # 6x50 = up to 300 recent resolved positions
@@ -313,7 +312,6 @@ def main():
     qualified["Score"] = qualified.apply(compute_score, axis=1)
     qualified = (qualified
                  .sort_values("Score", ascending=False)
-                 .head(TOP_N_OUTPUT)
                  .drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num", "_hold_num"]))
     df = df.drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num", "_hold_num"])
     # Step 5: save
@@ -346,10 +344,80 @@ def main():
                      "Score", "Wallet"]
         qualified[best_cols].to_csv(best_file, index=False)
     elapsed = round(time.time() - t0, 1)
+    watchlist_path = os.path.join(os.path.dirname(__file__), "watchlist.csv")
+    today_str = datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%Y-%m-%d")
+    def load_watchlist():
+        if not os.path.exists(watchlist_path):
+            return pd.DataFrame(), None
+        try:
+            df = pd.read_csv(watchlist_path)
+            last_date = df["Date"].iloc[-1] if not df.empty and "Date" in df.columns else None
+            return df, last_date
+        except Exception:
+            return pd.DataFrame(), None
+    def save_watchlist(df_watch):
+        df_watch.to_csv(watchlist_path, index=False)
+    prev_watch, last_update_date = load_watchlist()
+    prev_wallets = set(prev_watch["Wallet"].tolist()) if not prev_watch.empty else set()
+    watchlist_updated = False
+    if not qualified.empty:
+        if last_update_date != today_str:
+            today_wallets = set(qualified["Wallet"].tolist())
+            new_wallets = today_wallets - prev_wallets
+            gone_wallets = prev_wallets - today_wallets
+            watch_records = []
+            for _, row in qualified.iterrows():
+                wallet = row["Wallet"]
+                prev_rows = prev_watch[prev_watch["Wallet"] == wallet] if not prev_watch.empty else pd.DataFrame()
+                if not prev_rows.empty:
+                    last_seen = prev_rows.iloc[-1]
+                    consecutive = int(last_seen.get("Consecutive_Days", 0)) + 1
+                    prev_score = last_seen.get("Score", 0)
+                    status = "STABLE"
+                    if consecutive >= 5:
+                        status = "PROVEN"
+                    elif consecutive >= 2:
+                        status = "STABLE"
+                    if row.get("Score", 0) > prev_score:
+                        status = "IMPROVING" if status != "PROVEN" else "PROVEN"
+                    elif row.get("Score", 0) < prev_score:
+                        status = "DEGRADING"
+                else:
+                    consecutive = 1
+                    status = "NEW"
+                watch_records.append({
+                    "Date": today_str,
+                    "Wallet": wallet,
+                    "Name": row.get("Name", ""),
+                    "Win_Rate_%": row.get("Win_Rate_%", ""),
+                    "Recency_WR": row.get("Recency_WR", ""),
+                    "Sample": row.get("Sample", ""),
+                    "Risk_Reward": row.get("Risk_Reward", ""),
+                    "Avg_Hold_Days": row.get("Avg_Hold_Days", ""),
+                    "Markets_Traded": row.get("Markets_Traded", ""),
+                    "Score": row.get("Score", 0),
+                    "Consecutive_Days": consecutive,
+                    "Status": status,
+                })
+            df_watch_new = pd.DataFrame(watch_records)
+            if not prev_watch.empty:
+                df_watch_new = pd.concat([prev_watch[~prev_watch["Wallet"].isin(gone_wallets)], df_watch_new], ignore_index=True)
+            save_watchlist(df_watch_new)
+            watchlist_updated = True
     print("\n" + "=" * 70)
     print(f"Done in {elapsed}s")
     print(f"   Full data  -> {full_file}  ({len(df_passed)} traders)")
     print(f"   Shortlist  -> {best_file}  ({len(qualified)} traders)")
+    if not qualified.empty:
+        today_wallets = set(qualified["Wallet"].tolist())
+        prev_wallets = set(prev_watch["Wallet"].tolist()) if not prev_watch.empty else set()
+        new_wallets = today_wallets - prev_wallets
+        gone_wallets = prev_wallets - today_wallets
+        if watchlist_updated:
+            print(f"   Watchlist  -> {watchlist_path} (updated)")
+            print(f"   Changes    -> {len(new_wallets)} new, {len(gone_wallets)} gone")
+        else:
+            print(f"   Watchlist  -> {watchlist_path} (already updated today)")
     print(f"\n{'=' * 70}")
     if qualified.empty:
         print("No traders met all filters today.")
@@ -363,7 +431,14 @@ def main():
                              "Risk_Reward", "Avg_Hold_Days", "Markets_Traded",
                              "Score"]].copy()
         display.columns = ["Name", "Win%", "Recent_WR", "ProfRate", "RR", "Hold_D", "Mkts", "Score"]
-        print(display.to_string(index=False))
+        lines = display.to_string(index=False).split("\n")
+        for i, line in enumerate(lines):
+            if i == 0:
+                print(line)
+            elif 1 <= i <= min(5, len(lines) - 1):
+                print(f"\033[1m{line}\033[0m")
+            else:
+                print(line)
     print("=" * 70)
 if __name__ == "__main__":
     main()
