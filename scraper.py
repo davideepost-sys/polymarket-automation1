@@ -24,7 +24,7 @@ MIN_SPAN_DAYS      = 3       # need at least 3 days of trading history
 MIN_RISK_REWARD    = 0.5     # avg_win must be at least half of avg_loss (floor)
 MIN_MARKETS        = 3       # must trade across at least 3 distinct markets
 MAX_AVG_HOLD_DAYS  = 2.0     # day-traders only: avg hold <= 2 days
-LEADERBOARD_POOL   = 1000    # screen the top 1000 by weekly PNL
+LEADERBOARD_POOL   = 500     # screen the top 500 by weekly PNL
 # Polymarket's /closed-positions hard-caps at 50 per page
 CLOSED_PAGE_SIZE   = 50
 CLOSED_PAGES       = 6       # 6x50 = up to 300 recent resolved positions
@@ -302,17 +302,21 @@ def main():
     qualified = df[
         (df["_wr_num"] >= MIN_WIN_RATE) &
         (df["Profit_Rate"] >= MIN_PROFIT_RATE) &
-        (df["Confidence"] != "NO DATA") &
+        (df["Confidence"] == "OK") &
         (df["_rr_num"] >= MIN_RISK_REWARD) &
         (df["_mkt_num"] >= MIN_MARKETS) &
         (df["_span_num"] >= MIN_SPAN_DAYS) &
-        (df["_hold_num"].isna() | (df["_hold_num"] <= MAX_AVG_HOLD_DAYS)) &
+        (df["_hold_num"].notna() & (df["_hold_num"] <= MAX_AVG_HOLD_DAYS)) &
         (df["Total_Losses"] >= MIN_LOSSES)
     ].copy()
     qualified["Score"] = qualified.apply(compute_score, axis=1)
     qualified = (qualified
                  .sort_values("Score", ascending=False)
                  .drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num", "_hold_num"]))
+    qualified["Name"] = qualified.apply(
+        lambda r: f"{r['Name']} (Better sample)" if pd.to_numeric(r.get("Sample", 0), errors="coerce") > 100 else r["Name"],
+        axis=1
+    )
     df = df.drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num", "_hold_num"])
     # Step 5: save
     timestamp_str  = datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%Y%m%d-%H%M")
