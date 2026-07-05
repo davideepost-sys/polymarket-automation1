@@ -3,6 +3,7 @@ import sys
 import requests
 import pandas as pd
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
@@ -23,7 +24,7 @@ MIN_SPAN_DAYS      = 3       # need at least 3 days of trading history
 MIN_RISK_REWARD    = 0.5     # avg_win must be at least half of avg_loss (floor)
 MIN_MARKETS        = 3       # must trade across at least 3 distinct markets
 MAX_AVG_HOLD_DAYS  = 2.0     # day-traders only: avg hold <= 2 days
-LEADERBOARD_POOL   = 500     # screen the top 500 by weekly PNL
+LEADERBOARD_POOL   = 1000    # screen the top 1000 by weekly PNL
 TOP_N_OUTPUT       = 10      # show only the best 10 in the final list
 # Polymarket's /closed-positions hard-caps at 50 per page
 CLOSED_PAGE_SIZE   = 50
@@ -306,7 +307,7 @@ def main():
         (df["_rr_num"] >= MIN_RISK_REWARD) &
         (df["_mkt_num"] >= MIN_MARKETS) &
         (df["_span_num"] >= MIN_SPAN_DAYS) &
-        (df["_hold_num"].notna() & (df["_hold_num"] <= MAX_AVG_HOLD_DAYS)) &
+        (df["_hold_num"].isna() | (df["_hold_num"] <= MAX_AVG_HOLD_DAYS)) &
         (df["Total_Losses"] >= MIN_LOSSES)
     ].copy()
     qualified["Score"] = qualified.apply(compute_score, axis=1)
@@ -316,7 +317,7 @@ def main():
                  .drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num", "_hold_num"]))
     df = df.drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num", "_hold_num"])
     # Step 5: save
-    timestamp_str  = datetime.now().strftime("%Y%m%d-%H%M")
+    timestamp_str  = datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%Y%m%d-%H%M")
     full_file = f"smart_money_{timestamp_str}.csv"
     best_file = f"best_traders_{timestamp_str}.csv"
     col_order = [
