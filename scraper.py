@@ -19,7 +19,6 @@ WEEK_AGO_TS = NOW_TS - (7 * 24 * 60 * 60)
 MIN_WEEKLY_TRADES  = 20      # too few = can't trust the win rate
 MAX_WEEKLY_TRADES  = 500     # too many = bot, not safe on a small balance
 MIN_WIN_RATE       = 60.0    # % — must win majority of trades
-MIN_PROFIT_RATE    = 0.10    # must make at least 10c profit per $1 volume
 MIN_SPAN_DAYS      = 3       # need at least 3 days of trading history
 MIN_RISK_REWARD    = 0.5     # avg_win must be at least half of avg_loss (floor)
 MIN_MARKETS        = 3       # must trade across at least 3 distinct markets
@@ -180,9 +179,8 @@ def recent_win_rate(wallet):
     }
 # ── Composite ranking score ────────────────────────────────────
 def compute_score(row):
-    # NOTE: Profit_Rate / Profit_$ / Volume_$ from the leaderboard API are
-    # unreliable (often show impossible values). We rank ONLY on real
-    # closed-position metrics: win rate, risk-reward, sample, diversity, speed.
+    # Rank ONLY on real closed-position metrics: win rate, risk-reward, sample, diversity, speed.
+    # Leaderboard Profit_$ / Volume_$ are unreliable — we use Weekly_PnL_$ instead.
     wr  = (row.get("Recency_WR") or 0) / 100
     n   = min(row.get("Sample", 0), 200) / 200
     avg_w = row.get("Avg_Win_$", 0)
@@ -202,10 +200,6 @@ def screen(entry):
     wallet = entry.get("proxyWallet")
     if not wallet:
         return None
-    pnl    = float(entry.get("pnl", 0))
-    volume = float(entry.get("vol", 0))
-    if volume <= 0:
-        return None
     trades = weekly_trade_count(wallet)
     in_band = MIN_WEEKLY_TRADES <= trades <= MAX_WEEKLY_TRADES
     print(f"  {'ok' if in_band else 'no'} "
@@ -216,9 +210,6 @@ def screen(entry):
         "Wallet":        wallet,
         "Name":          entry.get("userName") or entry.get("xUsername") or wallet[:8] + "...",
         "Weekly_Trades": trades,
-        "Profit_$":      round(pnl, 2),
-        "Volume_$":      round(volume, 2),
-        "Profit_Rate":   round(pnl / volume, 4),
     }
 def analyze(trader):
     wr = recent_win_rate(trader["Wallet"])
@@ -235,8 +226,7 @@ def analyze(trader):
     resolved_str = f"{wr['resolved_wins']}W/{wr['resolved_losses']}L"
     early_str    = f"{wr['early_exit_wins']}W/{wr['early_exit_losses']}L"
     total_losses = wr["resolved_losses"] + wr["early_exit_losses"]
-    # Real net PnL from closed positions (wins minus losses). This is the
-    # trustworthy profitability check — ignores the leaderboard Profit_Rate.
+    # Real net PnL from closed positions (wins minus losses).
     net_pnl = round(wr["avg_win"] * (wr["resolved_wins"] + wr["early_exit_wins"])
                     - abs(wr["avg_loss"]) * (wr["resolved_losses"] + wr["early_exit_losses"]), 2)
     return {
@@ -266,7 +256,7 @@ def main():
     t0 = time.time()
     print("Polymarket Smart Money Analyzer v2")
     print(f"   Filters: {MIN_WEEKLY_TRADES}-{MAX_WEEKLY_TRADES} trades/wk | "
-          f"WR >= {MIN_WIN_RATE}% | PR >= {MIN_PROFIT_RATE}")
+          f"WR >= {MIN_WIN_RATE}%")
     print(f"   Day-traders only: avg hold <= {MAX_AVG_HOLD_DAYS}d | "
           f"Recency weighting | Market diversity | Risk-reward")
     print(f"   No API key needed - direct Polymarket API, completely free")
@@ -345,8 +335,7 @@ def main():
         "Sample", "Sample_Span_Days", "Resolved", "Early_Exit", "Pushes",
         "Confidence", "Avg_Win_$", "Avg_Loss_$", "Risk_Reward", "Net_PnL_$",
         "Weekly_PnL_$", "Weekly_Resolved", "Markets_Traded", "Avg_Hold_Days",
-        "Median_Hold_Days", "Matched_Positions",
-        "Profit_$", "Volume_$", "Profit_Rate"
+        "Median_Hold_Days", "Matched_Positions"
     ]
     df["_score"] = df.apply(
         lambda r: compute_score(r) if r.get("Confidence") == "OK" else 0, axis=1
@@ -444,10 +433,10 @@ def main():
     print(f"\n{'=' * 70}")
     if qualified.empty:
         print("No traders met all filters today.")
-        print("   Tip: check full CSV - you may want to loosen MIN_WIN_RATE or MIN_PROFIT_RATE.")
+        print("   Tip: check full CSV - you may want to loosen MIN_WIN_RATE.")
     else:
         print(f"TOP {len(qualified)} TRADERS TO COPY-TRADE TODAY")
-        print(f"   Filters: WR >= {MIN_WIN_RATE}% | PR >= {MIN_PROFIT_RATE} | "
+        print(f"   Filters: WR >= {MIN_WIN_RATE}% | "
               f"RR >= {MIN_RISK_REWARD} | Mkts >= {MIN_MARKETS} | "
               f"Hold <= {MAX_AVG_HOLD_DAYS}d | Span >= {MIN_SPAN_DAYS}d\n")
         display = qualified[["Name", "Win_Rate_%", "Recency_WR", "Weekly_PnL_$",
