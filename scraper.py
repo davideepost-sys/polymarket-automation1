@@ -173,8 +173,10 @@ def recent_win_rate(wallet):
     }
 # ── Composite ranking score ────────────────────────────────────
 def compute_score(row):
+    # NOTE: Profit_Rate / Profit_$ / Volume_$ from the leaderboard API are
+    # unreliable (often show impossible values). We rank ONLY on real
+    # closed-position metrics: win rate, risk-reward, sample, diversity, speed.
     wr  = (row.get("Recency_WR") or 0) / 100
-    pr  = min(row.get("Profit_Rate", 0), 1.0)
     n   = min(row.get("Sample", 0), 200) / 200
     avg_w = row.get("Avg_Win_$", 0)
     avg_l = abs(row.get("Avg_Loss_$", 0)) or 0.01
@@ -185,7 +187,8 @@ def compute_score(row):
         speed = max(0.0, 1.0 - (hold / 4.0))
     else:
         speed = 0.3
-    score = (0.25 * wr) + (0.20 * pr) + (0.15 * n) + (0.15 * rr) + (0.10 * mkts) + (0.15 * speed)
+    # Weights sum to 1.0 — no profit-rate component.
+    score = (0.35 * wr) + (0.25 * rr) + (0.15 * n) + (0.10 * mkts) + (0.15 * speed)
     return round(score, 4)
 # ── Worker functions (run in threads) ─────────────────────────
 def screen(entry):
@@ -225,6 +228,10 @@ def analyze(trader):
     resolved_str = f"{wr['resolved_wins']}W/{wr['resolved_losses']}L"
     early_str    = f"{wr['early_exit_wins']}W/{wr['early_exit_losses']}L"
     total_losses = wr["resolved_losses"] + wr["early_exit_losses"]
+    # Real net PnL from closed positions (wins minus losses). This is the
+    # trustworthy profitability check — ignores the leaderboard Profit_Rate.
+    net_pnl = round(wr["avg_win"] * (wr["resolved_wins"] + wr["early_exit_wins"])
+                    - abs(wr["avg_loss"]) * (wr["resolved_losses"] + wr["early_exit_losses"]), 2)
     return {
         **trader,
         "Win_Rate_%":         wr_val if wr_val is not None else "N/A",
@@ -242,6 +249,7 @@ def analyze(trader):
         "Avg_Hold_Days":      wr["avg_hold_days"],
         "Median_Hold_Days":   wr["median_hold_days"],
         "Matched_Positions":  wr["matched_positions"],
+        "Net_PnL_$":          net_pnl,
         "Confidence":         confidence,
     }
 # ── Main ───────────────────────────────────────────────────────
@@ -301,13 +309,13 @@ def main():
     df["_hold_num"] = pd.to_numeric(df["Avg_Hold_Days"], errors="coerce")
     qualified = df[
         (df["_wr_num"] >= MIN_WIN_RATE) &
-        (df["Profit_Rate"] >= MIN_PROFIT_RATE) &
         (df["Confidence"] == "OK") &
         (df["_rr_num"] >= MIN_RISK_REWARD) &
         (df["_mkt_num"] >= MIN_MARKETS) &
         (df["_span_num"] >= MIN_SPAN_DAYS) &
         (df["_hold_num"].notna() & (df["_hold_num"] <= MAX_AVG_HOLD_DAYS)) &
-        (df["Total_Losses"] >= MIN_LOSSES)
+        (df["Total_Losses"] >= MIN_LOSSES) &
+        (pd.to_numeric(df["Net_PnL_$"], errors="coerce") > 0)
     ].copy()
     qualified["Score"] = qualified.apply(compute_score, axis=1)
     qualified = (qualified
@@ -325,8 +333,8 @@ def main():
     col_order = [
         "Wallet", "Name", "Score", "Weekly_Trades", "Win_Rate_%", "Recency_WR",
         "Sample", "Sample_Span_Days", "Resolved", "Early_Exit", "Pushes",
-        "Confidence", "Avg_Win_$", "Avg_Loss_$", "Risk_Reward", "Markets_Traded",
-        "Avg_Hold_Days", "Median_Hold_Days", "Matched_Positions",
+        "Confidence", "Avg_Win_$", "Avg_Loss_$", "Risk_Reward", "Net_PnL_$",
+        "Markets_Traded", "Avg_Hold_Days", "Median_Hold_Days", "Matched_Positions",
         "Profit_$", "Volume_$", "Profit_Rate"
     ]
     df["_score"] = df.apply(
@@ -343,9 +351,8 @@ def main():
         df_passed = df_sorted.iloc[0:0]
         df_passed[existing_cols].to_csv(full_file, index=False)
     if not qualified.empty:
-        best_cols = ["Name", "Win_Rate_%", "Recency_WR", "Profit_Rate",
-                     "Risk_Reward", "Avg_Hold_Days", "Markets_Traded",
-                     "Score", "Wallet"]
+        best_cols = ["Name", "Win_Rate_%", "Recency_WR", "Net_PnL_$", "Risk_Reward",
+                     "Avg_Hold_Days", "Markets_Traded", "Score", "Wallet"]
         qualified[best_cols].to_csv(best_file, index=False)
     elapsed = round(time.time() - t0, 1)
     watchlist_path = os.path.join(os.path.dirname(__file__), "watchlist.csv")
@@ -431,10 +438,10 @@ def main():
         print(f"   Filters: WR >= {MIN_WIN_RATE}% | PR >= {MIN_PROFIT_RATE} | "
               f"RR >= {MIN_RISK_REWARD} | Mkts >= {MIN_MARKETS} | "
               f"Hold <= {MAX_AVG_HOLD_DAYS}d | Span >= {MIN_SPAN_DAYS}d\n")
-        display = qualified[["Name", "Win_Rate_%", "Recency_WR", "Profit_Rate",
+        display = qualified[["Name", "Win_Rate_%", "Recency_WR", "Net_PnL_$",
                              "Risk_Reward", "Avg_Hold_Days", "Markets_Traded",
                              "Score"]].copy()
-        display.columns = ["Name", "Win%", "Recent_WR", "ProfRate", "RR", "Hold_D", "Mkts", "Score"]
+        display.columns = ["Name", "Win%", "Recent_WR", "Net_PnL", "RR", "Hold_D", "Mkts", "Score"]
         lines = display.to_string(index=False).split("\n")
         for i, line in enumerate(lines):
             if i == 0:
