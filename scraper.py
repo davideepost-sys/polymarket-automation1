@@ -98,6 +98,8 @@ def recent_win_rate(wallet):
     three_days_ago = NOW_TS - (3 * 24 * 60 * 60)
     weighted_wins = 0.0
     weighted_total = 0.0
+    weekly_pnl = 0.0
+    weekly_trades = 0
     for page in range(CLOSED_PAGES):
         data = get("/closed-positions", {
             "user": wallet,
@@ -125,6 +127,9 @@ def recent_win_rate(wallet):
                 oldest_ts = ts
             if mkt:
                 markets_seen.add(mkt)
+            if ts and ts >= WEEK_AGO_TS:
+                weekly_pnl += pnl_f
+                weekly_trades += 1
             if asset and asset in entry_map and ts:
                 hold_days = (ts - entry_map[asset]) / 86400
                 if hold_days >= 0:
@@ -170,6 +175,8 @@ def recent_win_rate(wallet):
         "avg_hold_days":    avg_hold,
         "median_hold_days": median_hold,
         "matched_positions": len(hold_times),
+        "weekly_pnl":       round(weekly_pnl, 2),
+        "weekly_trades_resolved": weekly_trades,
     }
 # ── Composite ranking score ────────────────────────────────────
 def compute_score(row):
@@ -250,6 +257,8 @@ def analyze(trader):
         "Median_Hold_Days":   wr["median_hold_days"],
         "Matched_Positions":  wr["matched_positions"],
         "Net_PnL_$":          net_pnl,
+        "Weekly_PnL_$":       wr["weekly_pnl"],
+        "Weekly_Resolved":    wr["weekly_trades_resolved"],
         "Confidence":         confidence,
     }
 # ── Main ───────────────────────────────────────────────────────
@@ -315,7 +324,8 @@ def main():
         (df["_span_num"] >= MIN_SPAN_DAYS) &
         (df["_hold_num"].notna() & (df["_hold_num"] <= MAX_AVG_HOLD_DAYS)) &
         (df["Total_Losses"] >= MIN_LOSSES) &
-        (pd.to_numeric(df["Net_PnL_$"], errors="coerce") > 0)
+        (pd.to_numeric(df["Net_PnL_$"], errors="coerce") > 0) &
+        (pd.to_numeric(df["Weekly_PnL_$"], errors="coerce") > 0)
     ].copy()
     qualified["Score"] = qualified.apply(compute_score, axis=1)
     qualified = (qualified
@@ -334,7 +344,8 @@ def main():
         "Wallet", "Name", "Score", "Weekly_Trades", "Win_Rate_%", "Recency_WR",
         "Sample", "Sample_Span_Days", "Resolved", "Early_Exit", "Pushes",
         "Confidence", "Avg_Win_$", "Avg_Loss_$", "Risk_Reward", "Net_PnL_$",
-        "Markets_Traded", "Avg_Hold_Days", "Median_Hold_Days", "Matched_Positions",
+        "Weekly_PnL_$", "Weekly_Resolved", "Markets_Traded", "Avg_Hold_Days",
+        "Median_Hold_Days", "Matched_Positions",
         "Profit_$", "Volume_$", "Profit_Rate"
     ]
     df["_score"] = df.apply(
@@ -351,7 +362,7 @@ def main():
         df_passed = df_sorted.iloc[0:0]
         df_passed[existing_cols].to_csv(full_file, index=False)
     if not qualified.empty:
-        best_cols = ["Name", "Win_Rate_%", "Recency_WR", "Net_PnL_$", "Risk_Reward",
+        best_cols = ["Name", "Win_Rate_%", "Recency_WR", "Weekly_PnL_$", "Net_PnL_$", "Risk_Reward",
                      "Avg_Hold_Days", "Markets_Traded", "Score", "Wallet"]
         qualified[best_cols].to_csv(best_file, index=False)
     elapsed = round(time.time() - t0, 1)
@@ -406,6 +417,7 @@ def main():
                     "Risk_Reward": row.get("Risk_Reward", ""),
                     "Avg_Hold_Days": row.get("Avg_Hold_Days", ""),
                     "Markets_Traded": row.get("Markets_Traded", ""),
+                    "Weekly_PnL_$": row.get("Weekly_PnL_$", ""),
                     "Score": row.get("Score", 0),
                     "Consecutive_Days": consecutive,
                     "Status": status,
@@ -438,10 +450,10 @@ def main():
         print(f"   Filters: WR >= {MIN_WIN_RATE}% | PR >= {MIN_PROFIT_RATE} | "
               f"RR >= {MIN_RISK_REWARD} | Mkts >= {MIN_MARKETS} | "
               f"Hold <= {MAX_AVG_HOLD_DAYS}d | Span >= {MIN_SPAN_DAYS}d\n")
-        display = qualified[["Name", "Win_Rate_%", "Recency_WR", "Net_PnL_$",
+        display = qualified[["Name", "Win_Rate_%", "Recency_WR", "Weekly_PnL_$",
                              "Risk_Reward", "Avg_Hold_Days", "Markets_Traded",
                              "Score"]].copy()
-        display.columns = ["Name", "Win%", "Recent_WR", "Net_PnL", "RR", "Hold_D", "Mkts", "Score"]
+        display.columns = ["Name", "Win%", "Recent_WR", "Week_PnL", "RR", "Hold_D", "Mkts", "Score"]
         lines = display.to_string(index=False).split("\n")
         for i, line in enumerate(lines):
             if i == 0:
