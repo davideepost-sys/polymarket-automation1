@@ -16,7 +16,7 @@ NOW_TS = int(datetime.now(timezone.utc).timestamp())
 WEEK_AGO_TS = NOW_TS - (7 * 24 * 60 * 60)
 
 # ------------------------------------------------------------
-# Filters – you can adjust these
+# Filters – adjust these as you like
 # ------------------------------------------------------------
 MIN_WEEKLY_TRADES = 20
 MAX_WEEKLY_TRADES = 500
@@ -101,7 +101,6 @@ def fetch_entry_timestamps(wallet):
 def recent_win_rate(wallet):
     entry_map = fetch_entry_timestamps(wallet)
 
-    # Stats based on realised PnL (reliable)
     wins = 0
     losses = 0
     pushes = 0
@@ -114,7 +113,6 @@ def recent_win_rate(wallet):
     weighted_wins = 0.0
     weighted_total = 0.0
 
-    # For display only (resolved/early‑exit categories)
     r_wins = r_losses = ee_wins = ee_losses = 0
 
     for page in range(CLOSED_PAGES):
@@ -146,13 +144,11 @@ def recent_win_rate(wallet):
             if mkt:
                 markets_seen.add(mkt)
 
-            # Hold time
             if asset and asset in entry_map and ts:
                 hold_days = (ts - entry_map[asset]) / 86400
                 if hold_days >= 0:
                     hold_times.append(hold_days)
 
-            # Win/loss based on realised PnL – the reliable way
             if pnl_f > 0:
                 wins += 1
                 win_pnl.append(pnl_f)
@@ -167,7 +163,6 @@ def recent_win_rate(wallet):
             else:
                 pushes += 1
 
-            # Display categories (not used for win rate)
             if cp_f >= 0.999:
                 r_wins += 1
             elif cp_f <= 0.001:
@@ -207,20 +202,18 @@ def recent_win_rate(wallet):
     }
 
 # ------------------------------------------------------------
-# Composite ranking score (Profit Rate has 20% weight; RR not included)
+# Composite ranking score
 # ------------------------------------------------------------
 def compute_score(row):
     wr = (row.get("Recency_WR") or 0) / 100
-    pr = min(row.get("Profit_Rate", 0), 1.0)          # 20% weight
-    n = min(row.get("Sample", 0), 200) / 200           # 15%
-    mkts = min(row.get("Markets_Traded", 0), 15) / 15  # 10%
+    pr = min(row.get("Profit_Rate", 0), 1.0)
+    n = min(row.get("Sample", 0), 200) / 200
+    mkts = min(row.get("Markets_Traded", 0), 15) / 15
     hold = row.get("Avg_Hold_Days")
     if hold is not None:
-        speed = max(0.0, 1.0 - (hold / 4.0))           # 15%
+        speed = max(0.0, 1.0 - (hold / 4.0))
     else:
         speed = 0.3
-    # Weights: WR 25%, PR 20%, sample 15%, markets 10%, speed 15% = 85% total
-    # (RR has 0% weight)
     score = (0.25 * wr) + (0.20 * pr) + (0.15 * n) + (0.10 * mkts) + (0.15 * speed)
     return round(score, 4)
 
@@ -254,7 +247,6 @@ def analyze(trader):
     wr = recent_win_rate(trader["Wallet"])
     wr_val = wr["win_rate"]
     sample = wr["sample"]
-    # Confidence labels: LOW < 40, OK between 40 and 74, Good data >= 75
     if sample < MIN_SAMPLE:
         confidence = "LOW"
     elif sample < 75:
@@ -312,7 +304,7 @@ def main():
     for offset in range(0, LEADERBOARD_POOL, page_size):
         limit = min(page_size, LEADERBOARD_POOL - offset)
         page = get("/v1/leaderboard", {
-            "timePeriod": "WEEK",          # <-- WEEKLY, not monthly
+            "timePeriod": "WEEK",
             "orderBy": "PNL",
             "limit": limit,
             "offset": offset
@@ -322,10 +314,21 @@ def main():
         lb.extend(page)
         if len(page) < page_size:
             break
+
+    total_fetched = len(lb)
+    
+    # ------------------------------------------------------------
+    # FIX: Deduplicate by proxyWallet (keep first/highest-ranked)
+    # ------------------------------------------------------------
+    seen = set()
+    lb = [x for x in lb if x["proxyWallet"] not in seen and not seen.add(x["proxyWallet"])]
+    duplicates_removed = total_fetched - len(lb)
+    
     if not lb:
-        print("Failed to fetch leaderboard.")
+        print("Failed to fetch leaderboard (empty after dedup).")
         sys.exit(1)
-    print(f"{len(lb)} traders retrieved.\n")
+    
+    print(f"{total_fetched} traders retrieved, {duplicates_removed} duplicates removed, {len(lb)} unique traders.\n")
 
     # Step 2: Phase 1 - trade-count screening
     print(f"PHASE 1: trade-count screen ({MAX_WORKERS} parallel)...")
@@ -357,7 +360,6 @@ def main():
     df["_span_num"] = pd.to_numeric(df["Sample_Span_Days"], errors="coerce")
     df["_hold_num"] = pd.to_numeric(df["Avg_Hold_Days"], errors="coerce")
 
-    # Filter: require confidence not LOW (i.e., sample >= 40)
     qualified = df[
         (df["wr_num"] >= MIN_WIN_RATE) &
         (df["Profit_Rate"] >= MIN_PROFIT_RATE) &
@@ -371,7 +373,6 @@ def main():
     if qualified.empty:
         print("\nNo traders met all filters today.")
         print(" Tip: check full CSV - you may want to loosen MIN_WIN_RATE or MIN_PROFIT_RATE.")
-        # Save empty CSV anyway (with all analysed traders)
         timestamp_str = datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%Y%m%d-%H%M")
         full_file = f"smart_money_{timestamp_str}.csv"
         df[["Wallet", "Name", "Weekly_Trades", "Win_Rate_%", "Recency_WR",
@@ -382,11 +383,10 @@ def main():
         print(f" Full data saved to {full_file}")
         return
 
-    # Compute scores and sort
     qualified["Score"] = qualified.apply(compute_score, axis=1)
     qualified = qualified.sort_values("Score", ascending=False)
 
-    # Step 5: save only the full CSV (one file, no watchlist)
+    # Step 5: save only the full CSV (one file)
     timestamp_str = datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%Y%m%d-%H%M")
     full_file = f"smart_money_{timestamp_str}.csv"
 
@@ -405,7 +405,6 @@ def main():
     print(f"Done in {elapsed}s")
     print(f" Full data -> {full_file} ({len(qualified)} traders)")
 
-    # Display top traders in console (bold for top 5)
     print(f"\nTOP {len(qualified)} TRADERS TO COPY-TRADE TODAY")
     print(f" Filters: WR >= {MIN_WIN_RATE}% | PR >= {MIN_PROFIT_RATE} | "
           f"RR >= {MIN_RISK_REWARD} | Mkts >= {MIN_MARKETS} | "
@@ -419,7 +418,7 @@ def main():
         if i == 0:
             print(line)
         elif 1 <= i <= min(5, len(lines) - 1):
-            print(f"\033[1m{line}\033[0m")   # bold for top 5
+            print(f"\033[1m{line}\033[0m")
         else:
             print(line)
     print("=" * 70)
