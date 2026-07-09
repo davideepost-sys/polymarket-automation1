@@ -18,17 +18,16 @@ WEEK_AGO_TS = NOW_TS - (7 * 24 * 60 * 60)
 # ------------------------------------------------------------
 # Filters – you can adjust these
 # ------------------------------------------------------------
-MIN_WEEKLY_TRADES = 20          # too few = can't trust win rate
-MAX_WEEKLY_TRADES = 500         # too many = bot risk
-MIN_WIN_RATE = 60.0             # % – must win majority
-MIN_PROFIT_RATE = 0.10          # profit / volume
-MIN_SPAN_DAYS = 3               # at least 3 days of history
-MIN_RISK_REWARD = 0.5           # still used for filtering (but not scoring)
-MIN_MARKETS = 3                 # must trade across at least 3 markets
-MAX_AVG_HOLD_DAYS = 2.0         # day‑traders only
-LEADERBOARD_POOL = 500          # screen top 500 weekly by PNL
+MIN_WEEKLY_TRADES = 20
+MAX_WEEKLY_TRADES = 500
+MIN_WIN_RATE = 60.0
+MIN_PROFIT_RATE = 0.10
+MIN_SPAN_DAYS = 3
+MIN_RISK_REWARD = 0.5
+MIN_MARKETS = 3
+MAX_AVG_HOLD_DAYS = 2.0
+LEADERBOARD_POOL = 500
 
-# API pagination
 CLOSED_PAGE_SIZE = 50
 CLOSED_PAGES = 5                # 250 most recent closed positions
 MIN_SAMPLE = 40                 # minimum trades to trust (filter)
@@ -81,7 +80,6 @@ def weekly_trade_count(wallet, cap=MAX_WEEKLY_TRADES + 100):
 # Phase 2: win rate + market diversity + hold time
 # ------------------------------------------------------------
 def fetch_entry_timestamps(wallet):
-    """Get earliest BUY timestamp per asset (for hold‑time estimation)."""
     asset_map = {}
     for page in range(ACTIVITY_PAGES):
         data = get("/activity", {
@@ -116,7 +114,7 @@ def recent_win_rate(wallet):
     weighted_wins = 0.0
     weighted_total = 0.0
 
-    # For display: old curPrice categories (not used for win rate)
+    # For display only (resolved/early‑exit categories)
     r_wins = r_losses = ee_wins = ee_losses = 0
 
     for page in range(CLOSED_PAGES):
@@ -148,13 +146,13 @@ def recent_win_rate(wallet):
             if mkt:
                 markets_seen.add(mkt)
 
-            # Hold time (using earliest BUY for that asset)
+            # Hold time
             if asset and asset in entry_map and ts:
                 hold_days = (ts - entry_map[asset]) / 86400
                 if hold_days >= 0:
                     hold_times.append(hold_days)
 
-            # Win/loss based on realised PnL
+            # Win/loss based on realised PnL – the reliable way
             if pnl_f > 0:
                 wins += 1
                 win_pnl.append(pnl_f)
@@ -169,7 +167,7 @@ def recent_win_rate(wallet):
             else:
                 pushes += 1
 
-            # Still compute resolved/early‑exit categories for display
+            # Display categories (not used for win rate)
             if cp_f >= 0.999:
                 r_wins += 1
             elif cp_f <= 0.001:
@@ -215,7 +213,6 @@ def compute_score(row):
     wr = (row.get("Recency_WR") or 0) / 100
     pr = min(row.get("Profit_Rate", 0), 1.0)          # 20% weight
     n = min(row.get("Sample", 0), 200) / 200           # 15%
-    # RR is not used in scoring (weight = 0)
     mkts = min(row.get("Markets_Traded", 0), 15) / 15  # 10%
     hold = row.get("Avg_Hold_Days")
     if hold is not None:
@@ -223,6 +220,7 @@ def compute_score(row):
     else:
         speed = 0.3
     # Weights: WR 25%, PR 20%, sample 15%, markets 10%, speed 15% = 85% total
+    # (RR has 0% weight)
     score = (0.25 * wr) + (0.20 * pr) + (0.15 * n) + (0.10 * mkts) + (0.15 * speed)
     return round(score, 4)
 
@@ -255,8 +253,8 @@ def screen(entry):
 def analyze(trader):
     wr = recent_win_rate(trader["Wallet"])
     wr_val = wr["win_rate"]
-    # Confidence labels: LOW < 40, OK between 40 and 74, Good data >= 75
     sample = wr["sample"]
+    # Confidence labels: LOW < 40, OK between 40 and 74, Good data >= 75
     if sample < MIN_SAMPLE:
         confidence = "LOW"
     elif sample < 75:
@@ -363,7 +361,7 @@ def main():
     qualified = df[
         (df["wr_num"] >= MIN_WIN_RATE) &
         (df["Profit_Rate"] >= MIN_PROFIT_RATE) &
-        (df["Confidence"] != "LOW") &               # sample >= 40
+        (df["Confidence"] != "LOW") &
         (df["_rr_num"] >= MIN_RISK_REWARD) &
         (df["_mkt_num"] >= MIN_MARKETS) &
         (df["_span_num"] >= MIN_SPAN_DAYS) &
@@ -388,13 +386,7 @@ def main():
     qualified["Score"] = qualified.apply(compute_score, axis=1)
     qualified = qualified.sort_values("Score", ascending=False)
 
-    # (Optional) add note if sample > 100
-    qualified["Name"] = qualified.apply(
-        lambda r: f"{r['Name']} (Better sample)" if r.get("Sample", 0) > 100 else r["Name"],
-        axis=1
-    )
-
-    # Step 5: save only the full CSV (one file)
+    # Step 5: save only the full CSV (one file, no watchlist)
     timestamp_str = datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%Y%m%d-%H%M")
     full_file = f"smart_money_{timestamp_str}.csv"
 
