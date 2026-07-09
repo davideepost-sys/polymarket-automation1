@@ -7,35 +7,35 @@ from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-# ============================================================
-# NO API KEY NEEDED
-# Polymarket's Data API is fully public and free.
-# No ScraperAPI, no proxy, no secrets required.
-# ============================================================
+============================================================
+NO API KEY NEEDED
+Polymarket's Data API is fully public and free.
+No ScraperAPI, no proxy, no secrets required.
+============================================================
 DATA_API = "https://data-api.polymarket.com"
-NOW_TS      = int(datetime.now(timezone.utc).timestamp())
+NOW_TS = int(datetime.now(timezone.utc).timestamp())
 WEEK_AGO_TS = NOW_TS - (7 * 24 * 60 * 60)
-# ── Filters ────────────────────────────────────────────────────
-MIN_WEEKLY_TRADES  = 20      # too few = can't trust the win rate
-MAX_WEEKLY_TRADES  = 500     # too many = bot, not safe on a small balance
-MIN_WIN_RATE       = 60.0    # % — must win majority of trades
-MIN_PROFIT_RATE    = 0.10    # must make at least 10c profit per $1 volume
-MIN_SPAN_DAYS      = 3       # need at least 3 days of trading history
-MIN_RISK_REWARD    = 0.5     # avg_win must be at least half of avg_loss (floor)
-MIN_MARKETS        = 3       # must trade across at least 3 distinct markets
-MAX_AVG_HOLD_DAYS  = 2.0     # day-traders only: avg hold <= 2 days
-LEADERBOARD_POOL   = 500     # screen the top 500 by weekly PNL
-# Polymarket's /closed-positions hard-caps at 50 per page
-CLOSED_PAGE_SIZE   = 50
-CLOSED_PAGES       = 6       # 6x50 = up to 300 recent resolved positions
-MIN_SAMPLE         = 40      # need at least this many to trust a win rate
-MIN_LOSSES         = 0       # no minimum losses filter for now
-# How many BUY activity records to fetch for hold-time matching
-ACTIVITY_PAGES     = 5       # 5x500 = up to 2500 recent BUY trades
-MAX_WORKERS        = 5       # parallel threads — keeps runtime fast
+── Filters ────────────────────────────────────────────────────
+MIN_WEEKLY_TRADES = 20 # too few = can't trust the win rate
+MAX_WEEKLY_TRADES = 500 # too many = bot, not safe on a small balance
+MIN_WIN_RATE = 60.0 # % — must win majority of trades
+MIN_PROFIT_RATE = 0.10 # must make at least 10c profit per $1 volume
+MIN_SPAN_DAYS = 3 # need at least 3 days of trading history
+MIN_RISK_REWARD = 0.5 # avg_win must be at least half of avg_loss (floor)
+MIN_MARKETS = 3 # must trade across at least 3 distinct markets
+MAX_AVG_HOLD_DAYS = 2.0 # day-traders only: avg hold <= 2 days
+LEADERBOARD_POOL = 500 # screen the top 500 by weekly PNL
+Polymarket's /closed-positions hard-caps at 50 per page
+CLOSED_PAGE_SIZE = 50
+CLOSED_PAGES = 6 # 6x50 = up to 300 recent resolved positions
+MIN_SAMPLE = 40 # need at least this many to trust a win rate
+MIN_LOSSES = 0 # no minimum losses filter for now
+How many BUY activity records to fetch for hold-time matching
+ACTIVITY_PAGES = 5 # 5x500 = up to 2500 recent BUY trades
+MAX_WORKERS = 5 # parallel threads — keeps runtime fast
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "polymarket-analyzer/1.0"})
-# ── API helper ─────────────────────────────────────────────────
+── API helper ─────────────────────────────────────────────────
 def get(path, params=None, retries=3):
     url = f"{DATA_API}{path}"
     if params:
@@ -49,9 +49,9 @@ def get(path, params=None, retries=3):
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
             else:
-                print(f"    warn: {url} failed: {e}")
-    return None
-# ── Phase 1: weekly trade count (cheap) ────────────────────────
+                print(f" warn: {url} failed: {e}")
+                return None
+── Phase 1: weekly trade count (cheap) ────────────────────────
 def weekly_trade_count(wallet, cap=MAX_WEEKLY_TRADES + 100):
     total, offset = 0, 0
     while total < cap:
@@ -68,7 +68,7 @@ def weekly_trade_count(wallet, cap=MAX_WEEKLY_TRADES + 100):
             break
         offset += 500
     return total
-# ── Phase 2: win rate + market diversity + hold time ───────────
+── Phase 2: win rate + market diversity + hold time ───────────
 def fetch_entry_timestamps(wallet):
     asset_map = {}
     for page in range(ACTIVITY_PAGES):
@@ -81,7 +81,7 @@ def fetch_entry_timestamps(wallet):
             break
         for trade in data:
             asset = trade.get("asset")
-            ts    = trade.get("timestamp")
+            ts = trade.get("timestamp")
             if asset and ts and (asset not in asset_map or ts < asset_map[asset]):
                 asset_map[asset] = ts
         if len(data) < 500:
@@ -109,15 +109,15 @@ def recent_win_rate(wallet):
         if not data or not isinstance(data, list):
             break
         for pos in data:
-            ts    = pos.get("timestamp")
-            cp    = pos.get("curPrice")
-            pnl   = pos.get("realizedPnl")
-            mkt   = pos.get("market") or pos.get("conditionId") or pos.get("marketSlug")
+            ts = pos.get("timestamp")
+            cp = pos.get("curPrice")
+            pnl = pos.get("realizedPnl")
+            mkt = pos.get("market") or pos.get("conditionId") or pos.get("marketSlug")
             asset = pos.get("asset")
             if cp is None:
                 continue
             try:
-                cp_f  = float(cp)
+                cp_f = float(cp)
                 pnl_f = float(pnl) if pnl is not None else 0.0
             except (TypeError, ValueError):
                 continue
@@ -145,114 +145,115 @@ def recent_win_rate(wallet):
                     weighted_wins += weight
                 else:
                     ee_losses += 1; loss_pnl.append(pnl_f)
-                weighted_total += weight
+                    weighted_total += weight
         if len(data) < CLOSED_PAGE_SIZE:
             break
     total_w = r_wins + ee_wins
     total_l = r_losses + ee_losses
-    total   = total_w + total_l
+    total = total_w + total_l
     recency_wr = round(weighted_wins / weighted_total * 100, 1) if weighted_total else None
     avg_hold = round(sum(hold_times) / len(hold_times), 2) if hold_times else None
     median_hold = round(sorted(hold_times)[len(hold_times) // 2], 2) if hold_times else None
     return {
-        "win_rate":         round(total_w / total * 100, 1) if total else None,
-        "recency_wr":       recency_wr,
-        "sample":           total,
-        "resolved_wins":    r_wins,
-        "resolved_losses":  r_losses,
-        "early_exit_wins":  ee_wins,
+        "win_rate": round(total_w / total * 100, 1) if total else None,
+        "recency_wr": recency_wr,
+        "sample": total,
+        "resolved_wins": r_wins,
+        "resolved_losses": r_losses,
+        "early_exit_wins": ee_wins,
         "early_exit_losses":ee_losses,
-        "pushes":           pushes,
-        "avg_win":          round(sum(win_pnl) / len(win_pnl), 2) if win_pnl else 0.0,
-        "avg_loss":         round(sum(loss_pnl) / len(loss_pnl), 2) if loss_pnl else 0.0,
-        "span_days":        round((NOW_TS - oldest_ts) / 86400, 1) if oldest_ts else None,
-        "markets_traded":   len(markets_seen),
-        "avg_hold_days":    avg_hold,
+        "pushes": pushes,
+        "avg_win": round(sum(win_pnl) / len(win_pnl), 2) if win_pnl else 0.0,
+        "avg_loss": round(sum(loss_pnl) / len(loss_pnl), 2) if loss_pnl else 0.0,
+        "span_days": round((NOW_TS - oldest_ts) / 86400, 1) if oldest_ts else None,
+        "markets_traded": len(markets_seen),
+        "avg_hold_days": avg_hold,
         "median_hold_days": median_hold,
         "matched_positions": len(hold_times),
     }
-# ── Composite ranking score ────────────────────────────────────
+── Composite ranking score ────────────────────────────────────
 def compute_score(row):
-    wr  = (row.get("Recency_WR") or 0) / 100
-    pr  = min(row.get("Profit_Rate", 0), 1.0)
-    n   = min(row.get("Sample", 0), 200) / 200
+    wr = (row.get("Recency_WR") or 0) / 100
+    pr = min(row.get("Profit_Rate", 0), 1.0)
+    n = min(row.get("Sample", 0), 200) / 200
     avg_w = row.get("Avg_Win_$", 0)
     avg_l = abs(row.get("Avg_Loss_$", 0)) or 0.01
-    rr  = min(avg_w / avg_l, 5.0) / 5.0
+    rr = min(avg_w / avg_l, 5.0) / 5.0
     mkts = min(row.get("Markets_Traded", 0), 15) / 15
     hold = row.get("Avg_Hold_Days")
     if hold is not None:
         speed = max(0.0, 1.0 - (hold / 4.0))
     else:
         speed = 0.3
-    score = (0.25 * wr) + (0.20 * pr) + (0.15 * n) + (0.15 * rr) + (0.10 * mkts) + (0.15 * speed)
+    score = (0.25 * wr) + (0.20 * pr) + (0.15 * n) + (0.05 * rr) + (0.10 * mkts) + (0.15 * speed)
     return round(score, 4)
-# ── Worker functions (run in threads) ─────────────────────────
+── Worker functions (run in threads) ─────────────────────────
 def screen(entry):
     wallet = entry.get("proxyWallet")
     if not wallet:
         return None
-    pnl    = float(entry.get("pnl", 0))
+    pnl = float(entry.get("pnl", 0))
     volume = float(entry.get("vol", 0))
     if volume <= 0:
         return None
     trades = weekly_trade_count(wallet)
     in_band = MIN_WEEKLY_TRADES <= trades <= MAX_WEEKLY_TRADES
-    print(f"  {'ok' if in_band else 'no'} "
+    print(f" {'ok' if in_band else 'no'} "
           f"{entry.get('userName', wallet[:8]):<20} {trades:>4} trades/wk")
     if not in_band:
         return None
     return {
-        "Wallet":        wallet,
-        "Name":          entry.get("userName") or entry.get("xUsername") or wallet[:8] + "...",
+        "Wallet": wallet,
+        "Name": entry.get("userName") or entry.get("xUsername") or wallet[:8] + "...",
         "Weekly_Trades": trades,
-        "Profit_$":      round(pnl, 2),
-        "Volume_$":      round(volume, 2),
-        "Profit_Rate":   round(pnl / volume, 4),
+        "Profit_$": round(pnl, 2),
+        "Volume_$": round(volume, 2),
+        "Profit_Rate": round(pnl / volume, 4),
     }
 def analyze(trader):
     wr = recent_win_rate(trader["Wallet"])
     wr_val = wr["win_rate"]
     confidence = ("NO DATA" if wr["sample"] == 0
                   else "LOW" if wr["sample"] < MIN_SAMPLE
+                  else "Good data" if wr["sample"] >= 75
                   else "OK")
     rr_ratio = round(wr["avg_win"] / max(abs(wr["avg_loss"]), 0.01), 2) if wr["avg_loss"] != 0 else "N/A"
     hold_str = f"{wr['avg_hold_days']}d" if wr["avg_hold_days"] is not None else "?"
-    print(f"  {'ok' if wr_val and wr_val >= MIN_WIN_RATE else '  '} "
+    print(f" {'ok' if wr_val and wr_val >= MIN_WIN_RATE else ' ' } "
           f"{trader['Name']:<20} WR={wr_val}% "
           f"(n={wr['sample']}, hold={hold_str}, mkts={wr['markets_traded']}) "
           f"RR={rr_ratio} [{confidence}]")
     resolved_str = f"{wr['resolved_wins']}W/{wr['resolved_losses']}L"
-    early_str    = f"{wr['early_exit_wins']}W/{wr['early_exit_losses']}L"
+    early_str = f"{wr['early_exit_wins']}W/{wr['early_exit_losses']}L"
     total_losses = wr["resolved_losses"] + wr["early_exit_losses"]
     return {
         **trader,
-        "Win_Rate_%":         wr_val if wr_val is not None else "N/A",
-        "Recency_WR":         wr["recency_wr"],
-        "Sample":             wr["sample"],
-        "Sample_Span_Days":   wr["span_days"],
-        "Resolved":           resolved_str,
-        "Early_Exit":         early_str,
-        "Total_Losses":       total_losses,
-        "Pushes":             wr["pushes"],
-        "Avg_Win_$":          wr["avg_win"],
-        "Avg_Loss_$":         wr["avg_loss"],
-        "Risk_Reward":        rr_ratio,
-        "Markets_Traded":     wr["markets_traded"],
-        "Avg_Hold_Days":      wr["avg_hold_days"],
-        "Median_Hold_Days":   wr["median_hold_days"],
-        "Matched_Positions":  wr["matched_positions"],
-        "Confidence":         confidence,
+        "Win_Rate_%": wr_val if wr_val is not None else "N/A",
+        "Recency_WR": wr["recency_wr"],
+        "Sample": wr["sample"],
+        "Sample_Span_Days": wr["span_days"],
+        "Resolved": resolved_str,
+        "Early_Exit": early_str,
+        "Total_Losses": total_losses,
+        "Pushes": wr["pushes"],
+        "Avg_Win_$": wr["avg_win"],
+        "Avg_Loss_$": wr["avg_loss"],
+        "Risk_Reward": rr_ratio,
+        "Markets_Traded": wr["markets_traded"],
+        "Avg_Hold_Days": wr["avg_hold_days"],
+        "Median_Hold_Days": wr["median_hold_days"],
+        "Matched_Positions": wr["matched_positions"],
+        "Confidence": confidence,
     }
-# ── Main ───────────────────────────────────────────────────────
+── Main ───────────────────────────────────────────────────────
 def main():
     t0 = time.time()
     print("Polymarket Smart Money Analyzer v2")
-    print(f"   Filters: {MIN_WEEKLY_TRADES}-{MAX_WEEKLY_TRADES} trades/wk | "
+    print(f" Filters: {MIN_WEEKLY_TRADES}-{MAX_WEEKLY_TRADES} trades/wk | "
           f"WR >= {MIN_WIN_RATE}% | PR >= {MIN_PROFIT_RATE}")
-    print(f"   Day-traders only: avg hold <= {MAX_AVG_HOLD_DAYS}d | "
+    print(f" Day-traders only: avg hold <= {MAX_AVG_HOLD_DAYS}d | "
           f"Recency weighting | Market diversity | Risk-reward")
-    print(f"   No API key needed - direct Polymarket API, completely free")
+    print(f" No API key needed - direct Polymarket API, completely free")
     print("=" * 70)
     # Step 1: leaderboard (API caps at 50 per page, paginate to reach LEADERBOARD_POOL)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching top {LEADERBOARD_POOL} traders...")
@@ -261,7 +262,7 @@ def main():
     for offset in range(0, LEADERBOARD_POOL, page_size):
         limit = min(page_size, LEADERBOARD_POOL - offset)
         page = get("/v1/leaderboard", {
-            "timePeriod": "MONTH", "orderBy": "PNL", "limit": limit, "offset": offset
+            "timePeriod": "WEEK", "orderBy": "PNL", "limit": limit, "offset": offset
         })
         if not page or not isinstance(page, list):
             break
@@ -271,7 +272,8 @@ def main():
     if not lb:
         print("Failed to fetch leaderboard.")
         sys.exit(1)
-    print(f"{len(lb)} traders retrieved.\n")
+    print(f"{len(lb)} traders retrieved.
+")
     # Step 2: Phase 1 - parallel trade-count screening
     print(f"PHASE 1: trade-count screen ({MAX_WORKERS} parallel)...")
     survivors = []
@@ -280,8 +282,10 @@ def main():
             r = result.result()
             if r:
                 survivors.append(r)
-    print(f"\n{len(survivors)}/{len(lb)} passed trade-count filter "
-          f"({MIN_WEEKLY_TRADES}-{MAX_WEEKLY_TRADES}/wk).\n")
+    print(f"
+{len(survivors)}/{len(lb)} passed trade-count filter "
+          f"({MIN_WEEKLY_TRADES}-{MAX_WEEKLY_TRADES}/wk).
+")
     if not survivors:
         print("No survivors. Widen MIN/MAX_WEEKLY_TRADES and retry.")
         sys.exit(1)
@@ -293,16 +297,16 @@ def main():
             enriched.append(result.result())
     # Step 4: apply quality filters
     df = pd.DataFrame(enriched)
-    df["_wr_num"]   = pd.to_numeric(df["Win_Rate_%"], errors="coerce")
-    df["_rec_wr"]   = pd.to_numeric(df["Recency_WR"], errors="coerce")
-    df["_rr_num"]   = pd.to_numeric(df["Risk_Reward"], errors="coerce")
-    df["_mkt_num"]  = pd.to_numeric(df["Markets_Traded"], errors="coerce")
+    df["_wr_num"] = pd.to_numeric(df["Win_Rate_%"], errors="coerce")
+    df["_rec_wr"] = pd.to_numeric(df["Recency_WR"], errors="coerce")
+    df["_rr_num"] = pd.to_numeric(df["Risk_Reward"], errors="coerce")
+    df["_mkt_num"] = pd.to_numeric(df["Markets_Traded"], errors="coerce")
     df["_span_num"] = pd.to_numeric(df["Sample_Span_Days"], errors="coerce")
     df["_hold_num"] = pd.to_numeric(df["Avg_Hold_Days"], errors="coerce")
     qualified = df[
         (df["_wr_num"] >= MIN_WIN_RATE) &
         (df["Profit_Rate"] >= MIN_PROFIT_RATE) &
-        (df["Confidence"] == "OK") &
+        ((df["Confidence"] == "OK") | (df["Confidence"] == "Good data")) &
         (df["_rr_num"] >= MIN_RISK_REWARD) &
         (df["_mkt_num"] >= MIN_MARKETS) &
         (df["_span_num"] >= MIN_SPAN_DAYS) &
@@ -314,14 +318,12 @@ def main():
                  .sort_values("Score", ascending=False)
                  .drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num", "_hold_num"]))
     qualified["Name"] = qualified.apply(
-        lambda r: f"{r['Name']} (Better sample)" if pd.to_numeric(r.get("Sample", 0), errors="coerce") > 100 else r["Name"],
+        lambda r: f"{r['Name']} (Good data)" if pd.to_numeric(r.get("Sample", 0), errors="coerce") >= 75 else r["Name"],
         axis=1
     )
-    df = df.drop(columns=["_wr_num", "_rec_wr", "_rr_num", "_mkt_num", "_span_num", "_hold_num"])
     # Step 5: save
-    timestamp_str  = datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%Y%m%d-%H%M")
-    full_file = f"smart_money_{timestamp_str}.csv"
-    best_file = f"best_traders_{timestamp_str}.csv"
+    timestamp_str = datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%Y%m%d-%H%M")
+    full_file = f"smart_money_{timestamp_str}.csv" # Renamed for clarity, reflecting single output
     col_order = [
         "Wallet", "Name", "Score", "Weekly_Trades", "Win_Rate_%", "Recency_WR",
         "Sample", "Sample_Span_Days", "Resolved", "Early_Exit", "Pushes",
@@ -329,120 +331,44 @@ def main():
         "Avg_Hold_Days", "Median_Hold_Days", "Matched_Positions",
         "Profit_$", "Volume_$", "Profit_Rate"
     ]
-    df["_score"] = df.apply(
-        lambda r: compute_score(r) if r.get("Confidence") == "OK" else 0, axis=1
-    )
-    df_sorted = df.sort_values("_score", ascending=False).drop(columns="_score")
-    # Only save traders that passed all filters
-    existing_cols = [c for c in col_order if c in df_sorted.columns]
+    
+    # Filter for columns that actually exist in the qualified DataFrame
+    existing_cols = [c for c in col_order if c in qualified.columns]
     if not qualified.empty:
-        q_wallets = set(qualified["Wallet"])
-        df_passed = df_sorted[df_sorted["Wallet"].isin(q_wallets)]
-        df_passed[existing_cols].to_csv(full_file, index=False)
+        qualified[existing_cols].to_csv(full_file, index=False)
     else:
-        df_passed = df_sorted.iloc[0:0]
-        df_passed[existing_cols].to_csv(full_file, index=False)
-    if not qualified.empty:
-        best_cols = ["Name", "Win_Rate_%", "Recency_WR", "Profit_Rate",
-                     "Risk_Reward", "Avg_Hold_Days", "Markets_Traded",
-                     "Score", "Wallet"]
-        qualified[best_cols].to_csv(best_file, index=False)
+        # If no traders qualified, create an empty CSV with headers
+        pd.DataFrame(columns=existing_cols).to_csv(full_file, index=False)
     elapsed = round(time.time() - t0, 1)
-    watchlist_path = os.path.join(os.path.dirname(__file__), "watchlist.csv")
-    today_str = datetime.now(ZoneInfo("Europe/Stockholm")).strftime("%Y-%m-%d")
-    def load_watchlist():
-        if not os.path.exists(watchlist_path):
-            return pd.DataFrame(), None
-        try:
-            df = pd.read_csv(watchlist_path)
-            last_date = df["Date"].iloc[-1] if not df.empty and "Date" in df.columns else None
-            return df, last_date
-        except Exception:
-            return pd.DataFrame(), None
-    def save_watchlist(df_watch):
-        df_watch.to_csv(watchlist_path, index=False)
-    prev_watch, last_update_date = load_watchlist()
-    prev_wallets = set(prev_watch["Wallet"].tolist()) if not prev_watch.empty else set()
-    watchlist_updated = False
-    if not qualified.empty:
-        if last_update_date != today_str:
-            today_wallets = set(qualified["Wallet"].tolist())
-            new_wallets = today_wallets - prev_wallets
-            gone_wallets = prev_wallets - today_wallets
-            watch_records = []
-            for _, row in qualified.iterrows():
-                wallet = row["Wallet"]
-                prev_rows = prev_watch[prev_watch["Wallet"] == wallet] if not prev_watch.empty else pd.DataFrame()
-                if not prev_rows.empty:
-                    last_seen = prev_rows.iloc[-1]
-                    consecutive = int(last_seen.get("Consecutive_Days", 0)) + 1
-                    prev_score = last_seen.get("Score", 0)
-                    status = "STABLE"
-                    if consecutive >= 5:
-                        status = "PROVEN"
-                    elif consecutive >= 2:
-                        status = "STABLE"
-                    if row.get("Score", 0) > prev_score:
-                        status = "IMPROVING" if status != "PROVEN" else "PROVEN"
-                    elif row.get("Score", 0) < prev_score:
-                        status = "DEGRADING"
-                else:
-                    consecutive = 1
-                    status = "NEW"
-                watch_records.append({
-                    "Date": today_str,
-                    "Wallet": wallet,
-                    "Name": row.get("Name", ""),
-                    "Win_Rate_%": row.get("Win_Rate_%", ""),
-                    "Recency_WR": row.get("Recency_WR", ""),
-                    "Sample": row.get("Sample", ""),
-                    "Risk_Reward": row.get("Risk_Reward", ""),
-                    "Avg_Hold_Days": row.get("Avg_Hold_Days", ""),
-                    "Markets_Traded": row.get("Markets_Traded", ""),
-                    "Score": row.get("Score", 0),
-                    "Consecutive_Days": consecutive,
-                    "Status": status,
-                })
-            df_watch_new = pd.DataFrame(watch_records)
-            if not prev_watch.empty:
-                df_watch_new = pd.concat([prev_watch[~prev_watch["Wallet"].isin(gone_wallets)], df_watch_new], ignore_index=True)
-            save_watchlist(df_watch_new)
-            watchlist_updated = True
-    print("\n" + "=" * 70)
+    print("
+" + "=" * 70)
     print(f"Done in {elapsed}s")
-    print(f"   Full data  -> {full_file}  ({len(df_passed)} traders)")
-    print(f"   Shortlist  -> {best_file}  ({len(qualified)} traders)")
-    if not qualified.empty:
-        today_wallets = set(qualified["Wallet"].tolist())
-        prev_wallets = set(prev_watch["Wallet"].tolist()) if not prev_watch.empty else set()
-        new_wallets = today_wallets - prev_wallets
-        gone_wallets = prev_wallets - today_wallets
-        if watchlist_updated:
-            print(f"   Watchlist  -> {watchlist_path} (updated)")
-            print(f"   Changes    -> {len(new_wallets)} new, {len(gone_wallets)} gone")
-        else:
-            print(f"   Watchlist  -> {watchlist_path} (already updated today)")
-    print(f"\n{'=' * 70}")
+    print(f" Qualified traders data -> {full_file} ({len(qualified)} traders)")
+    
+    print(f"
+{'=' * 70}")
     if qualified.empty:
         print("No traders met all filters today.")
-        print("   Tip: check full CSV - you may want to loosen MIN_WIN_RATE or MIN_PROFIT_RATE.")
+        print(" Tip: check full CSV - you may want to loosen MIN_WIN_RATE or MIN_PROFIT_RATE.")
     else:
         print(f"TOP {len(qualified)} TRADERS TO COPY-TRADE TODAY")
-        print(f"   Filters: WR >= {MIN_WIN_RATE}% | PR >= {MIN_PROFIT_RATE} | "
+        print(f" Filters: WR >= {MIN_WIN_RATE}% | PR >= {MIN_PROFIT_RATE} | "
               f"RR >= {MIN_RISK_REWARD} | Mkts >= {MIN_MARKETS} | "
-              f"Hold <= {MAX_AVG_HOLD_DAYS}d | Span >= {MIN_SPAN_DAYS}d\n")
+              f"Hold <= {MAX_AVG_HOLD_DAYS}d | Span >= {MIN_SPAN_DAYS}d
+")
         display = qualified[["Name", "Win_Rate_%", "Recency_WR", "Profit_Rate",
                              "Risk_Reward", "Avg_Hold_Days", "Markets_Traded",
                              "Score"]].copy()
         display.columns = ["Name", "Win%", "Recent_WR", "ProfRate", "RR", "Hold_D", "Mkts", "Score"]
-        lines = display.to_string(index=False).split("\n")
+        lines = display.to_string(index=False).split("
+")
         for i, line in enumerate(lines):
             if i == 0:
                 print(line)
             elif 1 <= i <= min(5, len(lines) - 1):
-                print(f"\033[1m{line}\033[0m")
+                print(f"[1m{line}[0m")
             else:
                 print(line)
-    print("=" * 70)
+        print("=" * 70)
 if __name__ == "__main__":
     main()
