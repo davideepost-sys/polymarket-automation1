@@ -202,19 +202,24 @@ def recent_win_rate(wallet):
     }
 
 # ------------------------------------------------------------
-# Composite ranking score
+# Composite ranking score (weights: WR 25%, PR 20%, sample 15%,
+# speed 15%, mkts 10%, RR 5%) – total 100%
 # ------------------------------------------------------------
 def compute_score(row):
     wr = (row.get("Recency_WR") or 0) / 100
     pr = min(row.get("Profit_Rate", 0), 1.0)
     n = min(row.get("Sample", 0), 200) / 200
+    avg_w = row.get("Avg_Win_$", 0)
+    avg_l = abs(row.get("Avg_Loss_$", 0)) or 0.01
+    rr = min(avg_w / avg_l, 5.0) / 5.0          # capped at 5 and normalized to [0,1]
     mkts = min(row.get("Markets_Traded", 0), 15) / 15
     hold = row.get("Avg_Hold_Days")
-    if hold is not None:
-        speed = max(0.0, 1.0 - (hold / 4.0))
+    if hold is not None and hold > 0:
+        speed = max(0.0, 1.0 - (hold / 4.0))     # 0 days → 1.0, 4+ days → 0
     else:
         speed = 0.3
-    score = (0.25 * wr) + (0.20 * pr) + (0.15 * n) + (0.10 * mkts) + (0.15 * speed)
+
+    score = (0.25 * wr) + (0.20 * pr) + (0.15 * n) + (0.15 * speed) + (0.10 * mkts) + (0.05 * rr)
     return round(score, 4)
 
 # ------------------------------------------------------------
@@ -316,18 +321,16 @@ def main():
             break
 
     total_fetched = len(lb)
-    
-    # ------------------------------------------------------------
-    # FIX: Deduplicate by proxyWallet (keep first/highest-ranked)
-    # ------------------------------------------------------------
+
+    # Deduplicate by proxyWallet (keep first/highest-ranked)
     seen = set()
     lb = [x for x in lb if x["proxyWallet"] not in seen and not seen.add(x["proxyWallet"])]
     duplicates_removed = total_fetched - len(lb)
-    
+
     if not lb:
         print("Failed to fetch leaderboard (empty after dedup).")
         sys.exit(1)
-    
+
     print(f"{total_fetched} traders retrieved, {duplicates_removed} duplicates removed, {len(lb)} unique traders.\n")
 
     # Step 2: Phase 1 - trade-count screening
