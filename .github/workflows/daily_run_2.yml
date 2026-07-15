@@ -60,7 +60,7 @@ jobs:
 
         run: |
 
-          python3 scraper_2_fixed.py ${{ github.event.inputs.pool_size || '1000' }}
+          python3 scraper_2.py ${{ github.event.inputs.pool_size || '1000' }}
 
       
 
