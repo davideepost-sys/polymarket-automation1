@@ -1,4 +1,4 @@
-name: Daily Polymarket Analyzer
+name: Daily Polymarket Analyzer Variant 2
 
 on:
   schedule:
