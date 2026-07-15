@@ -1,5 +1,3 @@
-
-
 """
 Polymarket Smart Money — minimal, honest rebuild.
 Outputs EXACTLY five things per trader:
@@ -25,13 +23,15 @@ from urllib.error import HTTPError, URLError
 DATA_API = "https://data-api.polymarket.com"
 USER_AGENT = "polymarket-minimal/1.0"
 # ---- knobs (kept few on purpose) -----------------------------------------
-POOL = 50                 # how many top-of-leaderboard traders to look at
+POOL = 1000               # how many top-of-leaderboard traders to look at
 CLOSED_MAX_PAGES = 8      # closed positions to read: 8 x 50 = up to 400
 ACTIVITY_MAX_PAGES = 7    # buy history: 7 x 500 = up to 3500 (API caps offset at 3000)
 MIN_HOLD_MATCHES = 5      # need at least this many matched positions to trust avg hold
 MAX_RETRIES = 4           # how many times to retry a call before giving up
 BACKOFF_SECONDS = 2.0     # base wait between retries (grows each attempt)
 POLITE_DELAY = 0.15       # small pause between calls so we don't hammer the API
+MIN_TRADES_PER_WEEK = 21  # minimum trades per week to be considered
+MAX_TRADES_PER_WEEK = 700 # maximum trades per week to be considered
 # ==========================================================================
 #  Honest fetch layer — the heart of the "no silent guessing" rule
 # ==========================================================================
@@ -159,6 +159,35 @@ def profit_rate(entry):
     if not vol or vol <= 0 or pnl is None:
         return None
     return round(pnl / vol, 4)
+def weekly_trade_count(wallet):
+    """
+    Count how many trades this trader made in the past 7 days.
+    We fetch their recent activity and count trades from the last week.
+    Returns (trade_count, complete) where complete indicates if we got all data.
+    """
+    from datetime import datetime, timezone, timedelta
+    
+    rows, complete = _fetch_pages(
+        "/activity",
+        {"user": wallet, "type": "TRADE",
+         "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
+        page_size=500, max_pages=ACTIVITY_MAX_PAGES,
+    )
+    
+    # Calculate timestamp for 7 days ago
+    week_ago = int((datetime.now(timezone.utc) - timedelta(days=7)).timestamp())
+    
+    # Count trades from the past week
+    count = 0
+    for trade in rows:
+        ts = trade.get("timestamp")
+        if ts and ts >= week_ago:
+            count += 1
+        else:
+            # Since we're sorted DESC by timestamp, once we hit an old trade, stop
+            break
+    
+    return count, complete
 def entry_times(wallet):
     """
     Earliest BUY timestamp per asset (= when the trader entered that position).
@@ -245,52 +274,79 @@ def main():
         except ValueError:
             pass
     print("Polymarket Smart Money — minimal honest build")
-    print(f"Reading top {pool} weekly traders (by PNL)\n")
+    print(f"Reading top {pool} weekly traders (by PNL)")
+    print(f"Filtering for traders with {MIN_TRADES_PER_WEEK}-{MAX_TRADES_PER_WEEK} trades per week\n")
     lb = get_leaderboard(pool)
     if not lb:
         print("Could not read the leaderboard. Stopping.")
         sys.exit(1)
-    print(f"Got {len(lb)} traders. Now reading each one's history...\n")
-    results = []
+    print(f"Got {len(lb)} traders from leaderboard. Now filtering by trade frequency...\n")
+    filtered_traders = []
+    skipped_no_wallet = 0
+    skipped_trade_count = 0
+    
     for i, entry in enumerate(lb, 1):
         wallet = entry.get("proxyWallet")
         name = entry.get("userName") or entry.get("xUsername") or (wallet[:8] + "…")
         if not wallet:
+            skipped_no_wallet += 1
             continue
+        
+        # Check trade count first (fast check)
+        trade_count, count_complete = weekly_trade_count(wallet)
+        
+        if trade_count < MIN_TRADES_PER_WEEK or trade_count > MAX_TRADES_PER_WEEK:
+            skipped_trade_count += 1
+            if i % 50 == 0:  # Print progress every 50 traders
+                print(f"  Progress: {i}/{len(lb)} checked, {len(filtered_traders)} passed filter so far")
+            continue
+        
+        # This trader passed the filter - get their full stats
         pr = profit_rate(entry)
         wh = win_rate_and_hold(wallet)
+        
         flag = "OK  " if wh["complete"] else "PART"  # PART = partial/cut-off data
         note = "" if wh["complete"] else "  <-- INCOMPLETE (cut off, do not trust)"
         pr_s = "N/A" if pr is None else f"{pr}"
         wr_s = "N/A" if wh["win_rate"] is None else f"{wh['win_rate']}%"
         hold_s = "N/A" if wh["avg_hold_days"] is None else f"{wh['avg_hold_days']}d"
         print(f"[{i:>3}/{len(lb)}] {flag} {name[:22]:<22} "
-              f"PR={pr_s} WR={wr_s} Hold={hold_s} "
+              f"Trades/wk={trade_count} PR={pr_s} WR={wr_s} Hold={hold_s} "
               f"(n={wh['sample']}, matched={wh['matched']}){note}")
-        results.append({
+        filtered_traders.append({
             "Name": name,
             "TraderID": wallet,
+            "WeeklyTrades": trade_count,
             "ProfitRate": pr if pr is not None else "N/A",
             "WinRate": wh["win_rate"] if wh["win_rate"] is not None else "N/A",
             "AvgHoldingDays": wh["avg_hold_days"] if wh["avg_hold_days"] is not None else "N/A",
             "_complete": wh["complete"],
         })
-    # write the 5-column file
+    print(f"\nFiltering complete:")
+    print(f"  - Traders checked: {len(lb)}")
+    print(f"  - Skipped (no wallet): {skipped_no_wallet}")
+    print(f"  - Skipped (trade count outside {MIN_TRADES_PER_WEEK}-{MAX_TRADES_PER_WEEK}): {skipped_trade_count}")
+    print(f"  - Passed filter: {len(filtered_traders)}")
+    # write the 6-column file
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     out = f"traders_{stamp}.csv"
-    cols = ["Name", "TraderID", "ProfitRate", "WinRate", "AvgHoldingDays"]
+    cols = ["Name", "TraderID", "WeeklyTrades", "ProfitRate", "WinRate", "AvgHoldingDays"]
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
-        for r in results:
+        for r in filtered_traders:
             w.writerow({c: r[c] for c in cols})
-    incomplete = sum(1 for r in results if not r["_complete"])
-    print(f"\nDone. Wrote {len(results)} traders -> {out}")
+    incomplete = sum(1 for r in filtered_traders if not r["_complete"])
+    print(f"\nDone. Wrote {len(filtered_traders)} traders -> {out}")
     if incomplete:
         print(f"WARNING: {incomplete} trader(s) had INCOMPLETE data (cut off by "
               f"rate-limit or error). Their numbers are partial — re-run to confirm.")
     else:
         print("All traders fetched cleanly (no rate-limit cut-offs).")
+    
+    # Return the output filename for GitHub Actions
+    return out
 if __name__ == "__main__":
-    main()
-
+    output_file = main()
+    # Print the output filename for GitHub Actions to capture
+    print(f"::set-output name=csv_file::{output_file}")
