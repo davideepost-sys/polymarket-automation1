@@ -32,6 +32,10 @@ BACKOFF_SECONDS = 2.0     # base wait between retries (grows each attempt)
 POLITE_DELAY = 0.15       # small pause between calls so we don't hammer the API
 MIN_TRADES_PER_WEEK = 21  # minimum trades per week to be considered
 MAX_TRADES_PER_WEEK = 700 # maximum trades per week to be considered
+MIN_SAMPLE_SIZE = 10      # minimum closed positions to trust win rate
+MIN_PROFIT_RATE = 0.10    # minimum profit rate (10%) to be considered
+MIN_WIN_RATE = 75.0       # minimum win rate (75%) to be considered
+MAX_HOLD_DAYS = 1.5       # maximum average holding time (1.5 days) to be considered
 # ==========================================================================
 #  Honest fetch layer — the heart of the "no silent guessing" rule
 # ==========================================================================
@@ -275,7 +279,11 @@ def main():
             pass
     print("Polymarket Smart Money — minimal honest build")
     print(f"Reading top {pool} weekly traders (by PNL)")
-    print(f"Filtering for traders with {MIN_TRADES_PER_WEEK}-{MAX_TRADES_PER_WEEK} trades per week\n")
+    print(f"Filtering for traders with {MIN_TRADES_PER_WEEK}-{MAX_TRADES_PER_WEEK} trades/week")
+    print(f"  - Profit Rate > {MIN_PROFIT_RATE*100:.0f}%")
+    print(f"  - Win Rate > {MIN_WIN_RATE:.0f}%")
+    print(f"  - Avg Holding Time < {MAX_HOLD_DAYS} days")
+    print(f"  - Minimum sample size: {MIN_SAMPLE_SIZE} closed positions\n")
     lb = get_leaderboard(pool)
     if not lb:
         print("Could not read the leaderboard. Stopping.")
@@ -284,6 +292,10 @@ def main():
     filtered_traders = []
     skipped_no_wallet = 0
     skipped_trade_count = 0
+    skipped_low_profit = 0
+    skipped_low_winrate = 0
+    skipped_high_hold = 0
+    skipped_small_sample = 0
     
     for i, entry in enumerate(lb, 1):
         wallet = entry.get("proxyWallet")
@@ -301,10 +313,31 @@ def main():
                 print(f"  Progress: {i}/{len(lb)} checked, {len(filtered_traders)} passed filter so far")
             continue
         
-        # This trader passed the filter - get their full stats
+        # Get profit rate from leaderboard
         pr = profit_rate(entry)
+        if pr is None or pr < MIN_PROFIT_RATE:
+            skipped_low_profit += 1
+            continue
+        
+        # Get win rate and holding time
         wh = win_rate_and_hold(wallet)
         
+        # Filter: minimum sample size
+        if wh["sample"] < MIN_SAMPLE_SIZE:
+            skipped_small_sample += 1
+            continue
+        
+        # Filter: win rate
+        if wh["win_rate"] is None or wh["win_rate"] < MIN_WIN_RATE:
+            skipped_low_winrate += 1
+            continue
+        
+        # Filter: holding time
+        if wh["avg_hold_days"] is not None and wh["avg_hold_days"] > MAX_HOLD_DAYS:
+            skipped_high_hold += 1
+            continue
+        
+        # This trader passed ALL filters - print and save
         flag = "OK  " if wh["complete"] else "PART"  # PART = partial/cut-off data
         note = "" if wh["complete"] else "  <-- INCOMPLETE (cut off, do not trust)"
         pr_s = "N/A" if pr is None else f"{pr}"
@@ -326,7 +359,11 @@ def main():
     print(f"  - Traders checked: {len(lb)}")
     print(f"  - Skipped (no wallet): {skipped_no_wallet}")
     print(f"  - Skipped (trade count outside {MIN_TRADES_PER_WEEK}-{MAX_TRADES_PER_WEEK}): {skipped_trade_count}")
-    print(f"  - Passed filter: {len(filtered_traders)}")
+    print(f"  - Skipped (profit rate < {MIN_PROFIT_RATE*100:.0f}%): {skipped_low_profit}")
+    print(f"  - Skipped (sample size < {MIN_SAMPLE_SIZE}): {skipped_small_sample}")
+    print(f"  - Skipped (win rate < {MIN_WIN_RATE:.0f}%): {skipped_low_winrate}")
+    print(f"  - Skipped (holding time > {MAX_HOLD_DAYS} days): {skipped_high_hold}")
+    print(f"  - Passed ALL filters: {len(filtered_traders)}")
     # write the 6-column file
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     out = f"traders_{stamp}.csv"
