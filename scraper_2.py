@@ -380,10 +380,5 @@ def main():
               f"rate-limit or error). Their numbers are partial — re-run to confirm.")
     else:
         print("All traders fetched cleanly (no rate-limit cut-offs).")
-    
-    # Return the output filename for GitHub Actions
-    return out
 if __name__ == "__main__":
-    output_file = main()
-    # Print the output filename for GitHub Actions to capture
-    print(f"::set-output name=csv_file::{output_file}")
+    main()
