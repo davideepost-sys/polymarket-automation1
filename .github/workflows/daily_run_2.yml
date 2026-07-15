@@ -1,32 +1,39 @@
 name: Daily Polymarket Analyzer Variant 2
-
 on:
+  workflow_dispatch:
+    inputs:
+      pool_size:
+        description: 'Number of top traders to analyze (default: 1000)'
+        required: false
+        default: '1000'
+        type: string
   schedule:
-    - cron: '0 0 * * *'   # runs daily at midnight UTC
-  workflow_dispatch:      # allows manual trigger from GitHub UI
-
+    - cron: '0 6 * * 1'
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
-
-    - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
-
-    - name: Run scraper
-      run: python scraper_2.py
-
-    - name: Upload results
-      uses: actions/upload-artifact@v4
-      with:
-        name: polymarket-smart-money
-        path: smart_money_*.csv
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+      
+      - name: Run Polymarket Analyzer
+        run: |
+          python3 smart_money.py ${{ github.event.inputs.pool_size || '1000' }}
+      
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: polymarket-traders-${{ github.run_number }}
+          path: traders_*.csv
+          retention-days: 30
+          if-no-files-found: error
