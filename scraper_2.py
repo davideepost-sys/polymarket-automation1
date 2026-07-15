@@ -299,7 +299,11 @@ def analyze_trader(entry):
     # Composite Score: rewards higher win rate, higher profit rate, and
     # shorter holds (less time capital is exposed). All three inputs are
     # ones you already filter on — nothing hidden or new here.
-    score = round((win_rate / 100) * pr * (MAX_HOLD_DAYS / avg_hold), 4)
+    # Floor the denominator so a trader who holds for only a few minutes
+    # (avg_hold rounds to 0.0 days) doesn't cause a divide-by-zero crash.
+    # AvgHoldingDays shown in the CSV is still the real, unfloored number.
+    score_hold = max(avg_hold, 0.01)
+    score = round((win_rate / 100) * pr * (MAX_HOLD_DAYS / score_hold), 4)
 
     complete = activity_complete and closed_complete
     return {
