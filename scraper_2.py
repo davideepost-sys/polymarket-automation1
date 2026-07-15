@@ -1,12 +1,46 @@
 """
 Polymarket Smart Money — concurrent build for speed.
-Outputs EXACTLY five things per trader:
-    Name, TraderID, ProfitRate, WinRate, AvgHoldingDays
+
+Pipeline:
+  1. Pull the weekly PnL leaderboard (top POOL traders, last 7 days).
+  2. Keep only wallets doing MIN_TRADES_PER_WEEK-MAX_TRADES_PER_WEEK trades/week.
+  3. For survivors, pull their last CLOSED_POSITIONS_LIMIT closed positions
+     and compute WinRate, AvgWin, AvgLoss, AvgHoldingDays, MarketCount.
+  4. Apply WR / ProfitRate / hold-time filters, then rank by a composite Score.
+  5. Write survivors to a CSV.
+
 Design principles:
   1. No hidden math. Each number comes from a clearly named source.
   2. No silent guessing. Rate limits and errors are reported honestly.
   3. Concurrent processing — fetches multiple traders at once for speed.
+
 No API key needed — Polymarket's Data API is public.
+
+--- CHANGES FROM PREVIOUS VERSION ---
+1. FIXED: trade count now counts BOTH buys and sells (was BUY-only,
+   which undercounted real weekly activity by roughly half).
+2. FIXED: traders with too little holding-time data (fewer than
+   MIN_HOLD_MATCHES matched entries) are now REJECTED instead of being
+   silently waved through the max-hold filter with "N/A".
+3. FIXED: closed-positions fetch now caps at exactly 300 (was 400) to
+   match "last 300 closed positions."
+4. ADDED: AvgWin, AvgLoss, MarketCount — computed from data already
+   being fetched, no extra API calls.
+5. ADDED: composite Score = (WinRate/100) * ProfitRate * (MAX_HOLD_DAYS /
+   AvgHoldingDays). Transparent, three inputs you already filter on,
+   no hidden weights. Traders are now ranked by Score, not raw ProfitRate.
+6. NOTED (not auto-fixed, needs your input): AvgHoldingDays is still
+   computed only from the most recent ACTIVITY_MAX_PAGES of BUY
+   activity, so traders with old, long-held positions can still look
+   like they hold for less time than they really do. Increasing
+   ACTIVITY_MAX_PAGES helps but costs more API calls per trader.
+7. NOTED (not auto-fixed, needs your input): ProfitRate still comes
+   from the leaderboard's weekly pnl/vol, while WinRate/AvgWin/AvgLoss
+   come from up to 300 closed positions with no week limit — two
+   different data windows. If you want them consistent, ProfitRate
+   should be recomputed from the same closed-positions batch.
+8. NO drawdown / consecutive-loss filter added — this is a new feature,
+   not a bug fix, and needs you to decide thresholds first.
 """
 import sys
 import time
@@ -20,12 +54,14 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DATA_API = "https://data-api.polymarket.com"
-USER_AGENT = "polymarket-minimal/2.0"
+USER_AGENT = "polymarket-minimal/2.1"
 
 # ---- knobs ---------------------------------------------------------------
 POOL = 1000
-CLOSED_MAX_PAGES = 8
-ACTIVITY_MAX_PAGES = 5
+CLOSED_POSITIONS_LIMIT = 300     # "last 300 closed positions"
+CLOSED_PAGE_SIZE = 50
+CLOSED_MAX_PAGES = CLOSED_POSITIONS_LIMIT // CLOSED_PAGE_SIZE  # 6 pages
+ACTIVITY_MAX_PAGES = 5          # see NOTE 6 above re: hold-time bias
 MIN_HOLD_MATCHES = 5
 MAX_RETRIES = 3
 BACKOFF_SECONDS = 2.0
@@ -174,35 +210,44 @@ def analyze_trader(entry):
         return {"skip": "low_profit"}
 
     # --- activity data (shared by trade count + entry times) ---
+    # FIX #1: no "side" filter here anymore — we need BOTH buys and sells
+    # to get a true count of weekly trades. (Original only pulled BUY,
+    # which cut the real trade count roughly in half.)
     activity_rows, activity_complete = _fetch_pages(
         "/activity",
-        {"user": wallet, "type": "TRADE", "side": "BUY",
+        {"user": wallet, "type": "TRADE",
          "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
         page_size=500, max_pages=ACTIVITY_MAX_PAGES,
     )
 
-    # count trades in past 7 days
+    # count ALL trades (buys + sells) in past 7 days
     week_ago = int((datetime.now(timezone.utc) - timedelta(days=7)).timestamp())
     trade_count = sum(1 for t in activity_rows if t.get("timestamp", 0) >= week_ago)
     if trade_count < MIN_TRADES_PER_WEEK or trade_count > MAX_TRADES_PER_WEEK:
         return {"skip": "trade_count", "trade_count": trade_count}
 
-    # earliest BUY per asset
+    # earliest BUY per asset (only BUY side counts as a position "entry")
     entries = {}
     for t in activity_rows:
+        if t.get("side") != "BUY":
+            continue
         a, ts = t.get("asset"), t.get("timestamp")
         if a and ts and (a not in entries or ts < entries[a]):
             entries[a] = ts
 
-    # --- closed positions ---
+    # --- closed positions (last CLOSED_POSITIONS_LIMIT, most recent first) ---
     closed_rows, closed_complete = _fetch_pages(
         "/closed-positions",
         {"user": wallet, "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
-        page_size=50, max_pages=CLOSED_MAX_PAGES,
+        page_size=CLOSED_PAGE_SIZE, max_pages=CLOSED_MAX_PAGES,
     )
+    closed_rows = closed_rows[:CLOSED_POSITIONS_LIMIT]
 
     wins = losses = ties = 0
+    win_amounts = []
+    loss_amounts = []
     holds = []
+    markets = set()
     for p in closed_rows:
         pnl_val = p.get("realizedPnl")
         if pnl_val is None:
@@ -211,14 +256,18 @@ def analyze_trader(entry):
             pnl_val = float(pnl_val)
         except (TypeError, ValueError):
             continue
+        asset = p.get("asset")
+        if asset:
+            markets.add(asset)
         if pnl_val > 0:
             wins += 1
+            win_amounts.append(pnl_val)
         elif pnl_val < 0:
             losses += 1
+            loss_amounts.append(pnl_val)
         else:
             ties += 1
         ts = p.get("timestamp")
-        asset = p.get("asset")
         if ts and asset in entries:
             d = (ts - entries[asset]) / 86400.0
             if d >= 0:
@@ -232,9 +281,25 @@ def analyze_trader(entry):
     if win_rate < MIN_WIN_RATE:
         return {"skip": "low_winrate", "trade_count": trade_count, "win_rate": win_rate}
 
-    avg_hold = round(sum(holds) / len(holds), 2) if len(holds) >= MIN_HOLD_MATCHES else None
-    if avg_hold is not None and avg_hold > MAX_HOLD_DAYS:
+    # FIX #2: not enough matched holding-time data means we DON'T KNOW
+    # the hold time — that is a REJECT, not a free pass. The original
+    # code let these traders through as "N/A" without ever checking
+    # MAX_HOLD_DAYS.
+    if len(holds) < MIN_HOLD_MATCHES:
+        return {"skip": "insufficient_hold_data", "trade_count": trade_count,
+                 "win_rate": win_rate, "matched": len(holds)}
+
+    avg_hold = round(sum(holds) / len(holds), 2)
+    if avg_hold > MAX_HOLD_DAYS:
         return {"skip": "high_hold", "trade_count": trade_count, "win_rate": win_rate, "avg_hold": avg_hold}
+
+    avg_win = round(sum(win_amounts) / len(win_amounts), 2) if win_amounts else 0.0
+    avg_loss = round(sum(loss_amounts) / len(loss_amounts), 2) if loss_amounts else 0.0
+
+    # Composite Score: rewards higher win rate, higher profit rate, and
+    # shorter holds (less time capital is exposed). All three inputs are
+    # ones you already filter on — nothing hidden or new here.
+    score = round((win_rate / 100) * pr * (MAX_HOLD_DAYS / avg_hold), 4)
 
     complete = activity_complete and closed_complete
     return {
@@ -243,7 +308,11 @@ def analyze_trader(entry):
         "WeeklyTrades": trade_count,
         "ProfitRate": pr,
         "WinRate": win_rate,
-        "AvgHoldingDays": avg_hold if avg_hold is not None else "N/A",
+        "AvgWin": avg_win,
+        "AvgLoss": avg_loss,
+        "AvgHoldingDays": avg_hold,
+        "MarketCount": len(markets),
+        "Score": score,
         "_complete": complete,
         "sample": decided,
         "matched": len(holds),
@@ -273,7 +342,8 @@ def main():
 
     filtered_traders = []
     skipped = {"no_wallet": 0, "trade_count": 0, "low_profit": 0,
-               "small_sample": 0, "low_winrate": 0, "high_hold": 0}
+               "small_sample": 0, "low_winrate": 0, "high_hold": 0,
+               "insufficient_hold_data": 0}
     completed = 0
     total = len(lb)
 
@@ -293,10 +363,10 @@ def main():
             # passed all filters
             flag = "OK  " if result["_complete"] else "PART"
             note = "" if result["_complete"] else "  <-- INCOMPLETE"
-            hold_s = "N/A" if result["AvgHoldingDays"] == "N/A" else f"{result['AvgHoldingDays']}d"
             _safe_print(f"[{completed:>4}/{total}] {flag} {result['Name'][:22]:<22} "
                         f"Trades/wk={result['WeeklyTrades']} PR={result['ProfitRate']} "
-                        f"WR={result['WinRate']}% Hold={hold_s} "
+                        f"WR={result['WinRate']}% Hold={result['AvgHoldingDays']}d "
+                        f"Score={result['Score']} "
                         f"(n={result['sample']}, matched={result['matched']}){note}")
             filtered_traders.append(result)
 
@@ -307,16 +377,18 @@ def main():
     _safe_print(f"  - Skipped (profit rate < {MIN_PROFIT_RATE*100:.0f}%): {skipped['low_profit']}")
     _safe_print(f"  - Skipped (sample size < {MIN_SAMPLE_SIZE}): {skipped['small_sample']}")
     _safe_print(f"  - Skipped (win rate < {MIN_WIN_RATE:.0f}%): {skipped['low_winrate']}")
+    _safe_print(f"  - Skipped (not enough hold-time data): {skipped['insufficient_hold_data']}")
     _safe_print(f"  - Skipped (holding time > {MAX_HOLD_DAYS} days): {skipped['high_hold']}")
     _safe_print(f"  - Passed ALL filters: {len(filtered_traders)}")
 
-    # sort by profit rate descending
-    filtered_traders.sort(key=lambda r: r.get("ProfitRate", 0) if isinstance(r.get("ProfitRate"), (int, float)) else 0, reverse=True)
+    # rank by composite Score descending
+    filtered_traders.sort(key=lambda r: r.get("Score", 0) if isinstance(r.get("Score"), (int, float)) else 0, reverse=True)
 
     # write CSV
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     out = f"traders_{stamp}.csv"
-    cols = ["Name", "TraderID", "WeeklyTrades", "ProfitRate", "WinRate", "AvgHoldingDays"]
+    cols = ["Name", "TraderID", "WeeklyTrades", "ProfitRate", "WinRate",
+            "AvgWin", "AvgLoss", "AvgHoldingDays", "MarketCount", "Score"]
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
