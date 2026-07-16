@@ -69,10 +69,17 @@ POLITE_DELAY = 0.12
 
 MIN_TRADES_PER_WEEK = 21
 MAX_TRADES_PER_WEEK = 700
-MIN_SAMPLE_SIZE = 10
+MIN_SAMPLE_SIZE = 30            # was 10 — a 75% win rate on 11 trades is noise, not skill
 MIN_PROFIT_RATE = 0.10
+MAX_PROFIT_RATE = 2.00          # sanity ceiling: 200%+ weekly return on volume is
+                                 # almost never real skill — reject as a probable data glitch
 MIN_WIN_RATE = 75.0
 MAX_HOLD_DAYS = 1.5
+MIN_HOLD_COVERAGE = 0.30        # matched hold-times must cover at least 30% of a
+                                 # trader's decided trades, or the average isn't trustworthy
+MAX_LOSS_TO_WIN_RATIO = 2.0     # reject if the average loss is more than 2x the
+                                 # average win — a single bad trade shouldn't be able
+                                 # to erase several good ones
 
 WORKERS = 15                # how many traders to fetch in parallel
 
@@ -208,6 +215,11 @@ def analyze_trader(entry):
     pr = profit_rate(entry)
     if pr is None or pr < MIN_PROFIT_RATE:
         return {"skip": "low_profit"}
+    if pr > MAX_PROFIT_RATE:
+        # A 200%+ weekly return on volume is almost always a data artifact
+        # (e.g. tiny volume divided into an outsized pnl), not real skill.
+        # Reject rather than let it dominate the ranking.
+        return {"skip": "implausible_profit_rate"}
 
     # --- activity data (shared by trade count + entry times) ---
     # FIX #1: no "side" filter here anymore — we need BOTH buys and sells
@@ -289,12 +301,27 @@ def analyze_trader(entry):
         return {"skip": "insufficient_hold_data", "trade_count": trade_count,
                  "win_rate": win_rate, "matched": len(holds)}
 
+    # If only a small slice of a trader's decided trades have a matched
+    # buy-time, the average hold time is built off a cherry-picked handful,
+    # not a representative sample. This is what causes the fake "0.0 day"
+    # holds seen on very active traders — reject rather than trust it.
+    hold_coverage = len(holds) / decided
+    if hold_coverage < MIN_HOLD_COVERAGE:
+        return {"skip": "unreliable_hold_data", "trade_count": trade_count,
+                 "win_rate": win_rate, "matched": len(holds), "sample": decided}
+
     avg_hold = round(sum(holds) / len(holds), 2)
     if avg_hold > MAX_HOLD_DAYS:
         return {"skip": "high_hold", "trade_count": trade_count, "win_rate": win_rate, "avg_hold": avg_hold}
 
     avg_win = round(sum(win_amounts) / len(win_amounts), 2) if win_amounts else 0.0
     avg_loss = round(sum(loss_amounts) / len(loss_amounts), 2) if loss_amounts else 0.0
+
+    # Reject lopsided risk profiles: a high win rate doesn't help you if
+    # the rare loss is big enough to erase several wins' worth of profit.
+    if avg_win > 0 and abs(avg_loss) > MAX_LOSS_TO_WIN_RATIO * avg_win:
+        return {"skip": "risky_loss_ratio", "trade_count": trade_count,
+                 "win_rate": win_rate, "avg_win": avg_win, "avg_loss": avg_loss}
 
     # Composite Score: rewards higher win rate, higher profit rate, and
     # shorter holds (less time capital is exposed). All three inputs are
@@ -346,8 +373,10 @@ def main():
 
     filtered_traders = []
     skipped = {"no_wallet": 0, "trade_count": 0, "low_profit": 0,
-               "small_sample": 0, "low_winrate": 0, "high_hold": 0,
-               "insufficient_hold_data": 0}
+               "implausible_profit_rate": 0, "small_sample": 0,
+               "low_winrate": 0, "high_hold": 0,
+               "insufficient_hold_data": 0, "unreliable_hold_data": 0,
+               "risky_loss_ratio": 0}
     completed = 0
     total = len(lb)
 
@@ -379,10 +408,13 @@ def main():
     _safe_print(f"  - Skipped (no wallet): {skipped['no_wallet']}")
     _safe_print(f"  - Skipped (trade count outside {MIN_TRADES_PER_WEEK}-{MAX_TRADES_PER_WEEK}): {skipped['trade_count']}")
     _safe_print(f"  - Skipped (profit rate < {MIN_PROFIT_RATE*100:.0f}%): {skipped['low_profit']}")
+    _safe_print(f"  - Skipped (profit rate > {MAX_PROFIT_RATE*100:.0f}%, likely bad data): {skipped['implausible_profit_rate']}")
     _safe_print(f"  - Skipped (sample size < {MIN_SAMPLE_SIZE}): {skipped['small_sample']}")
     _safe_print(f"  - Skipped (win rate < {MIN_WIN_RATE:.0f}%): {skipped['low_winrate']}")
     _safe_print(f"  - Skipped (not enough hold-time data): {skipped['insufficient_hold_data']}")
+    _safe_print(f"  - Skipped (hold-time data covers < {MIN_HOLD_COVERAGE*100:.0f}% of trades): {skipped['unreliable_hold_data']}")
     _safe_print(f"  - Skipped (holding time > {MAX_HOLD_DAYS} days): {skipped['high_hold']}")
+    _safe_print(f"  - Skipped (avg loss > {MAX_LOSS_TO_WIN_RATIO}x avg win): {skipped['risky_loss_ratio']}")
     _safe_print(f"  - Passed ALL filters: {len(filtered_traders)}")
 
     # rank by composite Score descending
