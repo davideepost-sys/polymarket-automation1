@@ -5,8 +5,9 @@ Pipeline:
   1. Pull the weekly PnL leaderboard (top POOL traders, last 7 days).
   2. Keep only wallets doing MIN_TRADES_PER_WEEK-MAX_TRADES_PER_WEEK trades/week.
   3. For survivors, pull their last CLOSED_POSITIONS_LIMIT closed positions
-     and compute WinRate, AvgWin, AvgLoss, AvgHoldingDays, MarketCount.
-  4. Apply WR / ProfitRate / hold-time filters, then rank by a composite Score.
+     and compute WinRate, RR, AvgWin, AvgLoss, AvgHoldingDays, MarketCount.
+  4. Apply hard filters (WR / ProfitRate / hold-time / loss-ratio /
+     sample size), then rank survivors by a weighted composite Score.
   5. Write survivors to a CSV.
 
 Design principles:
@@ -17,36 +18,50 @@ Design principles:
 No API key needed — Polymarket's Data API is public.
 
 --- CHANGES FROM PREVIOUS VERSION ---
-1. FIXED: trade count now counts BOTH buys and sells (was BUY-only,
-   which undercounted real weekly activity by roughly half).
-2. FIXED: traders with too little holding-time data (fewer than
-   MIN_HOLD_MATCHES matched entries) are now REJECTED instead of being
-   silently waved through the max-hold filter with "N/A".
-3. FIXED: closed-positions fetch now caps at exactly 300 (was 400) to
-   match "last 300 closed positions."
-4. ADDED: AvgWin, AvgLoss, MarketCount — computed from data already
-   being fetched, no extra API calls.
-5. ADDED: composite Score = (WinRate/100) * ProfitRate * (MAX_HOLD_DAYS /
-   AvgHoldingDays). Transparent, three inputs you already filter on,
-   no hidden weights. Traders are now ranked by Score, not raw ProfitRate.
-6. NOTED (not auto-fixed, needs your input): AvgHoldingDays is still
-   computed only from the most recent ACTIVITY_MAX_PAGES of BUY
-   activity, so traders with old, long-held positions can still look
-   like they hold for less time than they really do. Increasing
-   ACTIVITY_MAX_PAGES helps but costs more API calls per trader.
-7. NOTED (not auto-fixed, needs your input): ProfitRate still comes
-   from the leaderboard's weekly pnl/vol, while WinRate/AvgWin/AvgLoss
-   come from up to 300 closed positions with no week limit — two
-   different data windows. If you want them consistent, ProfitRate
-   should be recomputed from the same closed-positions batch.
-8. NO drawdown / consecutive-loss filter added — this is a new feature,
-   not a bug fix, and needs you to decide thresholds first.
+1. FIXED: trade count now counts BOTH buys and sells (was BUY-only).
+2. FIXED: traders with too little holding-time data are REJECTED, not
+   waved through with "N/A".
+3. FIXED: closed-positions fetch caps at exactly 300.
+4. FIXED (accuracy): hold time is now matched per-trade via a FIFO
+   queue of buy timestamps per asset. The old version matched every
+   closed position on an asset to the SAME single "earliest buy ever
+   seen" for that asset — so a trader who round-tripped the same
+   market five times had all five holds measured against one stale
+   buy instead of each trade's own real entry. FIFO (oldest buy is
+   consumed by the oldest close) gives each trade its own real hold.
+5. ADDED: AvgWin, AvgLoss, RR (reward:risk = AvgWin / |AvgLoss|),
+   MarketCount — computed from data already being fetched.
+6. ADDED (filter): MIN_HOLD_DAYS floor. A trader whose average hold
+   rounds to ~0 is very likely running latency-sensitive arbitrage —
+   a copy-bot can't realistically react fast enough to replicate that
+   edge, so it's rejected even if every number about it is accurate.
+7. REPLACED: Score is no longer a naive multiplication (which let
+   near-zero hold time explode and dominate the entire ranking — the
+   #1 trader in a prior run scored 4x higher than #2 purely because
+   of that). Score is now a proper weighted composite:
+     ProfitRate 25% + WinRate 25% + RR 20% + AvgHoldingDays 15%
+     + SampleSize 7.5% + MarketCount 7.5%
+   Each metric is min-max normalized across the surviving pool first
+   (0-1 scale) so the percentages are real percentages of the final
+   score, not just raw numbers with wildly different scales fighting
+   each other. This can only be computed AFTER every trader has been
+   analyzed (needs the min/max across the whole survivor pool), so
+   Score is now assigned in a second pass in main(), not inside
+   analyze_trader().
+8. NOTED (not auto-fixed, needs your input): ProfitRate still comes
+   from the leaderboard's weekly pnl/vol, while WinRate/RR come from
+   up to 300 closed positions with no week limit — two different data
+   windows. If you want them fully consistent, ProfitRate should be
+   recomputed from the same closed-positions batch.
+9. NO drawdown / consecutive-loss filter added — this is a new
+   feature, not a bug fix, and needs you to decide thresholds first.
 """
 import sys
 import time
 import csv
 import json
 import threading
+from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -74,12 +89,24 @@ MIN_PROFIT_RATE = 0.10
 MAX_PROFIT_RATE = 2.00          # sanity ceiling: 200%+ weekly return on volume is
                                  # almost never real skill — reject as a probable data glitch
 MIN_WIN_RATE = 75.0
+MIN_HOLD_DAYS = 0.02            # ~29 minutes. Below this, a trade closes
+                                 # faster than a copy-bot can realistically
+                                 # react — reject even if the number is real,
+                                 # since it's not something you can copy.
 MAX_HOLD_DAYS = 1.5
 MIN_HOLD_COVERAGE = 0.30        # matched hold-times must cover at least 30% of a
                                  # trader's decided trades, or the average isn't trustworthy
 MAX_LOSS_TO_WIN_RATIO = 2.0     # reject if the average loss is more than 2x the
                                  # average win — a single bad trade shouldn't be able
                                  # to erase several good ones
+
+# Score weights — must sum to 1.0. See docstring point 7.
+WEIGHT_PROFIT_RATE = 0.25
+WEIGHT_WIN_RATE = 0.25
+WEIGHT_RR = 0.20
+WEIGHT_HOLD = 0.15
+WEIGHT_SAMPLE_SIZE = 0.075
+WEIGHT_MARKET_COUNT = 0.075
 
 WORKERS = 15                # how many traders to fetch in parallel
 
@@ -238,14 +265,19 @@ def analyze_trader(entry):
     if trade_count < MIN_TRADES_PER_WEEK or trade_count > MAX_TRADES_PER_WEEK:
         return {"skip": "trade_count", "trade_count": trade_count}
 
-    # earliest BUY per asset (only BUY side counts as a position "entry")
-    entries = {}
+    # FIFO queue of BUY timestamps per asset, oldest first. Each closed
+    # position later gets matched to its own earliest *unused* buy —
+    # not just the single earliest buy ever seen for that asset — so
+    # repeat round-trips on the same market get their own real hold
+    # time instead of all being measured against one stale buy.
+    buys_by_asset = defaultdict(list)
     for t in activity_rows:
         if t.get("side") != "BUY":
             continue
         a, ts = t.get("asset"), t.get("timestamp")
-        if a and ts and (a not in entries or ts < entries[a]):
-            entries[a] = ts
+        if a and ts:
+            buys_by_asset[a].append(ts)
+    buys_by_asset = {a: deque(sorted(ts_list)) for a, ts_list in buys_by_asset.items()}
 
     # --- closed positions (last CLOSED_POSITIONS_LIMIT, most recent first) ---
     closed_rows, closed_complete = _fetch_pages(
@@ -258,7 +290,6 @@ def analyze_trader(entry):
     wins = losses = ties = 0
     win_amounts = []
     loss_amounts = []
-    holds = []
     markets = set()
     for p in closed_rows:
         pnl_val = p.get("realizedPnl")
@@ -279,9 +310,21 @@ def analyze_trader(entry):
             loss_amounts.append(pnl_val)
         else:
             ties += 1
+
+    # Match each closed position to its own buy via FIFO: process closes
+    # oldest-first, and for each one consume the oldest still-unused buy
+    # on that asset. This gives repeat-traded markets accurate individual
+    # hold times instead of all sharing one stale buy timestamp.
+    holds = []
+    for p in sorted(closed_rows, key=lambda x: x.get("timestamp") or 0):
+        asset = p.get("asset")
         ts = p.get("timestamp")
-        if ts and asset in entries:
-            d = (ts - entries[asset]) / 86400.0
+        if not asset or not ts:
+            continue
+        queue = buys_by_asset.get(asset)
+        if queue:
+            buy_ts = queue.popleft()
+            d = (ts - buy_ts) / 86400.0
             if d >= 0:
                 holds.append(d)
 
@@ -311,6 +354,11 @@ def analyze_trader(entry):
                  "win_rate": win_rate, "matched": len(holds), "sample": decided}
 
     avg_hold = round(sum(holds) / len(holds), 2)
+    if avg_hold < MIN_HOLD_DAYS:
+        # Closes too fast to realistically copy-trade — likely latency-
+        # sensitive arbitrage, not a repeatable strategy you can follow.
+        return {"skip": "too_fast_to_copy", "trade_count": trade_count,
+                 "win_rate": win_rate, "avg_hold": avg_hold}
     if avg_hold > MAX_HOLD_DAYS:
         return {"skip": "high_hold", "trade_count": trade_count, "win_rate": win_rate, "avg_hold": avg_hold}
 
@@ -323,14 +371,11 @@ def analyze_trader(entry):
         return {"skip": "risky_loss_ratio", "trade_count": trade_count,
                  "win_rate": win_rate, "avg_win": avg_win, "avg_loss": avg_loss}
 
-    # Composite Score: rewards higher win rate, higher profit rate, and
-    # shorter holds (less time capital is exposed). All three inputs are
-    # ones you already filter on — nothing hidden or new here.
-    # Floor the denominator so a trader who holds for only a few minutes
-    # (avg_hold rounds to 0.0 days) doesn't cause a divide-by-zero crash.
-    # AvgHoldingDays shown in the CSV is still the real, unfloored number.
-    score_hold = max(avg_hold, 0.01)
-    score = round((win_rate / 100) * pr * (MAX_HOLD_DAYS / score_hold), 4)
+    # RR (reward:risk) = avg win / avg loss magnitude. If a trader has zero
+    # losses (100% win rate on all decided trades), RR is undefined — mark
+    # it None here and main() will assign it the best finite RR seen across
+    # the survivor pool once every trader has been analyzed.
+    rr = round(avg_win / abs(avg_loss), 4) if avg_loss != 0 else None
 
     complete = activity_complete and closed_complete
     return {
@@ -339,11 +384,11 @@ def analyze_trader(entry):
         "WeeklyTrades": trade_count,
         "ProfitRate": pr,
         "WinRate": win_rate,
+        "RR": rr,
         "AvgWin": avg_win,
         "AvgLoss": avg_loss,
         "AvgHoldingDays": avg_hold,
         "MarketCount": len(markets),
-        "Score": score,
         "_complete": complete,
         "sample": decided,
         "matched": len(holds),
@@ -374,7 +419,7 @@ def main():
     filtered_traders = []
     skipped = {"no_wallet": 0, "trade_count": 0, "low_profit": 0,
                "implausible_profit_rate": 0, "small_sample": 0,
-               "low_winrate": 0, "high_hold": 0,
+               "low_winrate": 0, "too_fast_to_copy": 0, "high_hold": 0,
                "insufficient_hold_data": 0, "unreliable_hold_data": 0,
                "risky_loss_ratio": 0}
     completed = 0
@@ -399,7 +444,6 @@ def main():
             _safe_print(f"[{completed:>4}/{total}] {flag} {result['Name'][:22]:<22} "
                         f"Trades/wk={result['WeeklyTrades']} PR={result['ProfitRate']} "
                         f"WR={result['WinRate']}% Hold={result['AvgHoldingDays']}d "
-                        f"Score={result['Score']} "
                         f"(n={result['sample']}, matched={result['matched']}){note}")
             filtered_traders.append(result)
 
@@ -413,17 +457,68 @@ def main():
     _safe_print(f"  - Skipped (win rate < {MIN_WIN_RATE:.0f}%): {skipped['low_winrate']}")
     _safe_print(f"  - Skipped (not enough hold-time data): {skipped['insufficient_hold_data']}")
     _safe_print(f"  - Skipped (hold-time data covers < {MIN_HOLD_COVERAGE*100:.0f}% of trades): {skipped['unreliable_hold_data']}")
+    _safe_print(f"  - Skipped (holding time < {MIN_HOLD_DAYS} days, too fast to copy): {skipped['too_fast_to_copy']}")
     _safe_print(f"  - Skipped (holding time > {MAX_HOLD_DAYS} days): {skipped['high_hold']}")
     _safe_print(f"  - Skipped (avg loss > {MAX_LOSS_TO_WIN_RATIO}x avg win): {skipped['risky_loss_ratio']}")
     _safe_print(f"  - Passed ALL filters: {len(filtered_traders)}")
 
+    # ----------------------------------------------------------------
+    # Score: computed HERE, not per-trader, because normalizing each
+    # metric needs the min/max across the whole surviving pool.
+    # ----------------------------------------------------------------
+    def _normalize(value, lo, hi):
+        if hi == lo:
+            return 1.0  # everyone tied on this metric — don't penalize anyone
+        return (value - lo) / (hi - lo)
+
+    if filtered_traders:
+        # RR: traders with zero losses have RR=None. Give them the best
+        # (highest) finite RR seen in the pool — zero losses is at least
+        # as good as the best observed win/loss ratio, not "unscored."
+        finite_rrs = [r["RR"] for r in filtered_traders if r["RR"] is not None]
+        best_rr = max(finite_rrs) if finite_rrs else 1.0
+        for r in filtered_traders:
+            if r["RR"] is None:
+                r["RR"] = best_rr
+
+        profit_vals = [r["ProfitRate"] for r in filtered_traders]
+        win_vals = [r["WinRate"] for r in filtered_traders]
+        rr_vals = [r["RR"] for r in filtered_traders]
+        hold_vals = [r["AvgHoldingDays"] for r in filtered_traders]
+        sample_vals = [r["sample"] for r in filtered_traders]
+        market_vals = [r["MarketCount"] for r in filtered_traders]
+
+        p_lo, p_hi = min(profit_vals), max(profit_vals)
+        w_lo, w_hi = min(win_vals), max(win_vals)
+        r_lo, r_hi = min(rr_vals), max(rr_vals)
+        h_lo, h_hi = min(hold_vals), max(hold_vals)
+        s_lo, s_hi = min(sample_vals), max(sample_vals)
+        m_lo, m_hi = min(market_vals), max(market_vals)
+
+        for r in filtered_traders:
+            norm_profit = _normalize(r["ProfitRate"], p_lo, p_hi)
+            norm_win = _normalize(r["WinRate"], w_lo, w_hi)
+            norm_rr = _normalize(r["RR"], r_lo, r_hi)
+            norm_hold = 1 - _normalize(r["AvgHoldingDays"], h_lo, h_hi)  # lower hold = better
+            norm_sample = _normalize(r["sample"], s_lo, s_hi)
+            norm_market = _normalize(r["MarketCount"], m_lo, m_hi)
+            r["Score"] = round(
+                WEIGHT_PROFIT_RATE * norm_profit +
+                WEIGHT_WIN_RATE * norm_win +
+                WEIGHT_RR * norm_rr +
+                WEIGHT_HOLD * norm_hold +
+                WEIGHT_SAMPLE_SIZE * norm_sample +
+                WEIGHT_MARKET_COUNT * norm_market,
+                4,
+            )
+
     # rank by composite Score descending
-    filtered_traders.sort(key=lambda r: r.get("Score", 0) if isinstance(r.get("Score"), (int, float)) else 0, reverse=True)
+    filtered_traders.sort(key=lambda r: r.get("Score", 0), reverse=True)
 
     # write CSV
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     out = f"traders_{stamp}.csv"
-    cols = ["Name", "TraderID", "WeeklyTrades", "ProfitRate", "WinRate",
+    cols = ["Name", "TraderID", "WeeklyTrades", "ProfitRate", "WinRate", "RR",
             "AvgWin", "AvgLoss", "AvgHoldingDays", "MarketCount", "Score"]
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
