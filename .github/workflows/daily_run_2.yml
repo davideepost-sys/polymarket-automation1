@@ -22,6 +22,105 @@ on:
                             # does NOT auto-adjust for daylight saving, so
                             # it'll run at 09:00 local once DST ends.
 
+permissions:
+  contents: write   # needed so this workflow can commit latest_traders.csv back to the repo
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    
+
+    steps:
+
+      - name: Checkout repository
+
+        uses: actions/checkout@v4
+
+      
+
+      - name: Set up Python
+
+        uses: actions/setup-python@v5
+
+        with:
+
+          python-version: '3.11'
+
+      
+
+      - name: Install dependencies
+
+        run: |
+
+          python3 -m pip install --upgrade pip
+
+      
+
+      - name: Run Polymarket Analyzer
+
+        run: |
+
+          python3 scraper_2.py ${{ github.event.inputs.pool_size || '1000' }}
+
+      
+
+      - name: Upload CSV artifact
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: polymarket-traders-${{ github.run_number }}
+
+          path: traders_*.csv
+
+          retention-days: 30
+
+          if-no-files-found: error
+
+      - name: Save latest CSV to repo
+        run: |
+          LATEST=$(ls -t traders_*.csv | head -n 1)
+          cp "$LATEST" latest_traders.csv
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add latest_traders.csv
+          git diff --staged --quiet && echo "No changes to commit" || git commit -m "Update latest_traders.csv ($LATEST)"
+          git push
+
+      - name: Send daily Telegram digest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 send_digest.py
+          name: Daily Polymarket Analyzer Variant 2
+
+on:
+
+  workflow_dispatch:
+
+    inputs:
+
+      pool_size:
+
+        description: 'Number of top traders to analyze (default: 1000)'
+
+        required: false
+
+        default: '1000'
+
+        type: string
+
+  schedule:
+
+    - cron: '0 6 * * *'   # daily, 06:00 UTC = 08:00 UTC+2. Fixed offset —
+                            # does NOT auto-adjust for daylight saving, so
+                            # it'll run at 09:00 local once DST ends.
+
 jobs:
 
   build:
