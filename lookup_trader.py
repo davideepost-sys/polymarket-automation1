@@ -5,20 +5,20 @@ result is 100% consistent with the daily list — same filters, same
 ProfitRate source (weekly leaderboard pnl/vol), same everything.
 
 How it works:
-  1. Resolve the input to a wallet address.
-     - If it already looks like a wallet (0x + 40 hex chars), use it as-is.
-     - Otherwise, search Polymarket's public profile search for an exact
-       username match.
-  2. Search the WEEKLY leaderboard for that wallet by paginating through
-     it (same endpoint scraper_2.py uses) until found or until
-     search_depth is reached. This finds their real rank, whatever it is.
-  3. Run scraper_2.analyze_trader() — the SAME function the daily run
-     uses — on their leaderboard entry. No separate/duplicate logic, so
-     this can never drift out of sync with scraper_2.py as it evolves.
-  4. Send the result to Telegram.
 
+Resolve the input to a wallet address.
+If it already looks like a wallet (0x + 40 hex chars), use it as-is.
+Otherwise, search Polymarket's public profile search for an exact
+username match.
+Search the WEEKLY leaderboard for that wallet by paginating through
+it (same endpoint scraper_2.py uses) until found or until
+search_depth is reached. This finds their real rank, whatever it is.
+Run scraper_2.analyze_trader() — the SAME function the daily run
+uses — on their leaderboard entry. No separate/duplicate logic, so
+this can never drift out of sync with scraper_2.py as it evolves.
+Send the result to Telegram.
 Usage:
-    python3 lookup_trader.py <username_or_wallet> [search_depth]
+python3 lookup_trader.py <username_or_wallet> [search_depth]
 
 search_depth: how many places into the weekly leaderboard to search
 before giving up (default 2000, hard cap 10000 — searching further
@@ -31,16 +31,16 @@ import json
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-import scraper_2  # reuse the exact same fetch/analysis logic — single source of truth
+import scraper_2 # reuse the exact same fetch/analysis logic — single source of truth
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
 DEFAULT_SEARCH_DEPTH = 2000
 MAX_SEARCH_DEPTH = 10000
-LEADERBOARD_PAGE_SIZE = 50  # matches scraper_2.get_leaderboard's page size
+LEADERBOARD_PAGE_SIZE = 50 # matches scraper_2.get_leaderboard's page size
 
-WALLET_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+WALLET_RE = re.compile(r"^0x[a-fA-F0-9]{40}$" )
 
 SKIP_REASONS_SV = {
     "low_profit": f"profitrate under {scraper_2.MIN_PROFIT_RATE*100:.0f}%",
@@ -55,12 +55,11 @@ SKIP_REASONS_SV = {
     "risky_loss_ratio": f"snittförlusten är mer än {scraper_2.MAX_LOSS_TO_WIN_RATIO}x snittvinsten — för riskabelt riskförhållande",
 }
 
-
 def resolve_wallet(identifier):
     """Returns (wallet_address, matched_username) or (None, None)."""
     if WALLET_RE.match(identifier):
         return identifier, None
-
+    
     url = f"{GAMMA_API}/public-search?" + urlencode({
         "q": identifier, "search_profiles": "true",
     })
@@ -71,7 +70,7 @@ def resolve_wallet(identifier):
     except Exception as e:
         print(f"Username-sökning misslyckades: {e}")
         return None, None
-
+    
     profiles = data.get("profiles") or []
     ident_lower = identifier.lower()
     for p in profiles:
@@ -81,7 +80,6 @@ def resolve_wallet(identifier):
                 return p.get("proxyWallet"), val
     return None, None
 
-
 def find_in_leaderboard(wallet, search_depth):
     """Paginate the weekly leaderboard looking for this wallet.
     Returns (entry, rank) or (None, None) if not found within search_depth."""
@@ -90,10 +88,9 @@ def find_in_leaderboard(wallet, search_depth):
     while offset < search_depth:
         limit = min(LEADERBOARD_PAGE_SIZE, search_depth - offset)
         try:
-            page = scraper_2._get("/v1/leaderboard", {
-                "timePeriod": "WEEK", "orderBy": "PNL",
-                "limit": limit, "offset": offset,
-            })
+            page = scraper_2.get_leaderboard_page(
+                "WEEK", "PNL", limit, offset
+            )
         except (scraper_2.RateLimited, scraper_2.FetchError) as e:
             print(f"Topplistan gick inte att hämta vid plats {offset}: {e}")
             break
@@ -107,67 +104,23 @@ def find_in_leaderboard(wallet, search_depth):
         offset += limit
     return None, None
 
-
-def send_telegram(text):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID saknas — skickar inget, skriver bara ut.")
-        return
-    url = TELEGRAM_API.format(token=token)
-    data = urlencode({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode()
-    req = Request(url, data=data)
-    try:
-        with urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        if not result.get("ok"):
-            print(f"Telegram-sändning misslyckades: {result}")
-    except Exception as e:
-        print(f"Telegram-sändning misslyckades: {e}")
-
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 lookup_trader.py <username_or_wallet> [search_depth]")
-        sys.exit(1)
-
-    identifier = sys.argv[1]
-    search_depth = DEFAULT_SEARCH_DEPTH
-    if len(sys.argv) > 2:
-        try:
-            search_depth = int(sys.argv[2])
-        except ValueError:
-            pass
-    search_depth = max(1, min(search_depth, MAX_SEARCH_DEPTH))
-
+def get_trader_analysis(identifier, search_depth=DEFAULT_SEARCH_DEPTH):
     wallet, matched_name = resolve_wallet(identifier)
     if not wallet:
-        msg = f'Hittade ingen Polymarket-trader som matchar "{identifier}".'
-        print(msg)
-        send_telegram(msg)
-        sys.exit(0)
-
-    print(f"Söker {wallet} i veckans topplista (upp till plats {search_depth})...")
+        return f'Hittade ingen Polymarket-trader som matchar "{identifier}".'
+    
     entry, rank = find_in_leaderboard(wallet, search_depth)
-
+    
     if not entry:
-        msg = (
+        return (
             f'Hittade inte "{identifier}" inom topp {search_depth} i veckans topplista.\n'
             f"Antingen har de för lite vinst/volym den här veckan för att synas alls, "
             f"eller ligger de längre ner — testa ett större sökdjup (max {MAX_SEARCH_DEPTH})."
         )
-        print(msg)
-        send_telegram(msg)
-        sys.exit(0)
-
+    
     name = entry.get("userName") or entry.get("xUsername") or (wallet[:8] + "…")
     result = scraper_2.analyze_trader(entry)
-
+    
     if result is None:
         msg = f"{name} (plats {rank}) saknar wallet-data — kan inte analyseras."
     elif "skip" in result:
@@ -182,20 +135,18 @@ def main():
         link_line = (
             f'\n🔗 <a href="https://polymarket.com/@{username_for_link}">Profil</a>'
             if username_for_link else ""
-        )
+         )
         rr_display = result["RR"] if result["RR"] is not None else "∞ (inga förluster)"
         msg = (
             f"<b>{name}</b> — plats {rank} i veckans topplista (sökt bland topp {search_depth}).\n"
             f"✅ Klarar ALLA dina kriterier!\n\n"
-            f"PR: {result['ProfitRate']*100:.1f}%  |  WR: {result['WinRate']}%  |  RR: {rr_display}\n"
-            f"Hold: {result['AvgHoldingDays']}d  |  Trades/vecka: {result['WeeklyTrades']}  |  "
+            f"PR: {result['ProfitRate']*100:.1f}% | WR: {result['WinRate']}% | RR: {rr_display}\n"
+            f"Hold: {result['AvgHoldingDays']}d | Trades/vecka: {result['WeeklyTrades']} | "
             f"Marknader: {result['MarketCount']}"
             f"{link_line}"
         )
+    return msg
 
-    print(msg)
-    send_telegram(msg)
-
-
-if __name__ == "__main__":
-    main()
+# The main function is removed as this file will be imported as a module.
+# def main():
+#    ...
