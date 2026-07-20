@@ -111,7 +111,7 @@ WEIGHT_MARKET_COUNT = 0.075
 WORKERS = 15                # how many traders to fetch in parallel
 
 # thread-safe print and lock for API politeness
-_print_lock = threading.Lock()
+_print_lock = threading.Lock( )
 _api_lock = threading.Lock()
 _last_call_time = [0.0]     # mutable container so threads share it
 
@@ -217,6 +217,15 @@ def get_leaderboard(pool):
             break
         offset += limit
     return rows[:pool]
+
+def get_leaderboard_page(time_period, order_by, limit, offset):
+    # This function is specifically for lookup_trader.py to get a single page
+    return _get("/v1/leaderboard", {
+        "timePeriod": time_period, 
+        "orderBy": order_by,
+        "limit": limit, 
+        "offset": offset,
+    })
 
 # ==========================================================================
 #  Per-trader analysis — everything needed for ONE trader
@@ -355,183 +364,129 @@ def analyze_trader(entry):
 
     avg_hold = round(sum(holds) / len(holds), 2)
     if avg_hold < MIN_HOLD_DAYS:
-        # Closes too fast to realistically copy-trade — likely latency-
-        # sensitive arbitrage, not a repeatable strategy you can follow.
+        # Closes too fast to realistically copy. See docstring point 6.
         return {"skip": "too_fast_to_copy", "trade_count": trade_count,
                  "win_rate": win_rate, "avg_hold": avg_hold}
     if avg_hold > MAX_HOLD_DAYS:
-        return {"skip": "high_hold", "trade_count": trade_count, "win_rate": win_rate, "avg_hold": avg_hold}
+        return {"skip": "high_hold", "trade_count": trade_count,
+                 "win_rate": win_rate, "avg_hold": avg_hold}
 
-    avg_win = round(sum(win_amounts) / len(win_amounts), 2) if win_amounts else 0.0
-    avg_loss = round(sum(loss_amounts) / len(loss_amounts), 2) if loss_amounts else 0.0
-
-    # Reject lopsided risk profiles: a high win rate doesn't help you if
-    # the rare loss is big enough to erase several wins' worth of profit.
-    if avg_win > 0 and abs(avg_loss) > MAX_LOSS_TO_WIN_RATIO * avg_win:
+    avg_win = sum(win_amounts) / wins if wins > 0 else 0
+    avg_loss = sum(loss_amounts) / losses if losses > 0 else 0
+    rr = round(abs(avg_win / avg_loss), 1) if avg_loss < 0 else None
+    if rr is not None and rr < MAX_LOSS_TO_WIN_RATIO:
         return {"skip": "risky_loss_ratio", "trade_count": trade_count,
-                 "win_rate": win_rate, "avg_win": avg_win, "avg_loss": avg_loss}
+                 "win_rate": win_rate, "avg_hold": avg_hold, "rr": rr}
 
-    # RR (reward:risk) = avg win / avg loss magnitude. If a trader has zero
-    # losses (100% win rate on all decided trades), RR is undefined — mark
-    # it None here and main() will assign it the best finite RR seen across
-    # the survivor pool once every trader has been analyzed.
-    rr = round(avg_win / abs(avg_loss), 4) if avg_loss != 0 else None
-
-    complete = activity_complete and closed_complete
     return {
-        "Name": name,
-        "TraderID": wallet,
-        "WeeklyTrades": trade_count,
         "ProfitRate": pr,
         "WinRate": win_rate,
         "RR": rr,
-        "AvgWin": avg_win,
-        "AvgLoss": avg_loss,
         "AvgHoldingDays": avg_hold,
+        "WeeklyTrades": trade_count,
         "MarketCount": len(markets),
-        "_complete": complete,
-        "sample": decided,
-        "matched": len(holds),
+        "SampleSize": decided,
     }
 
 # ==========================================================================
-#  Run — concurrent
+#  Main entry point
 # ==========================================================================
+
 def main():
-    pool = POOL
-    if len(sys.argv) > 1:
-        try:
-            pool = int(sys.argv[1])
-        except ValueError:
-            pass
+    _safe_print("Starting Polymarket Smart Money Analyzer...")
+    start_time = time.monotonic()
 
-    _safe_print("Polymarket Smart Money — concurrent build")
-    _safe_print(f"Reading top {pool} weekly traders (by PNL)")
-    _safe_print(f"Using {WORKERS} parallel workers\n")
+    # 1. Pull the weekly PnL leaderboard
+    _safe_print(f"Fetching top {POOL} traders from weekly leaderboard...")
+    leaderboard = get_leaderboard(POOL)
+    _safe_print(f"  Found {len(leaderboard)} traders.")
 
-    lb = get_leaderboard(pool)
-    if not lb:
-        _safe_print("Could not read the leaderboard. Stopping.")
-        sys.exit(1)
+    # 2. Filter by trade count (MIN_TRADES_PER_WEEK-MAX_TRADES_PER_WEEK)
+    # This is done inside analyze_trader now.
 
-    _safe_print(f"Got {len(lb)} traders from leaderboard. Analyzing with {WORKERS} workers...\n")
-
-    filtered_traders = []
-    skipped = {"no_wallet": 0, "trade_count": 0, "low_profit": 0,
-               "implausible_profit_rate": 0, "small_sample": 0,
-               "low_winrate": 0, "too_fast_to_copy": 0, "high_hold": 0,
-               "insufficient_hold_data": 0, "unreliable_hold_data": 0,
-               "risky_loss_ratio": 0}
-    completed = 0
-    total = len(lb)
-
+    # 3. Analyze each trader concurrently
+    _safe_print("Analyzing traders...")
+    analyzed_traders = []
     with ThreadPoolExecutor(max_workers=WORKERS) as executor:
-        future_to_entry = {executor.submit(analyze_trader, entry): entry for entry in lb}
-        for future in as_completed(future_to_entry):
-            completed += 1
-            result = future.result()
-            if result is None:
-                skipped["no_wallet"] += 1
-                continue
-            if "skip" in result:
-                skipped[result["skip"]] += 1
-                if completed % 100 == 0:
-                    _safe_print(f"  Progress: {completed}/{total} done, {len(filtered_traders)} passed so far")
-                continue
-            # passed all filters
-            flag = "OK  " if result["_complete"] else "PART"
-            note = "" if result["_complete"] else "  <-- INCOMPLETE"
-            _safe_print(f"[{completed:>4}/{total}] {flag} {result['Name'][:22]:<22} "
-                        f"Trades/wk={result['WeeklyTrades']} PR={result['ProfitRate']} "
-                        f"WR={result['WinRate']}% Hold={result['AvgHoldingDays']}d "
-                        f"(n={result['sample']}, matched={result['matched']}){note}")
-            filtered_traders.append(result)
+        futures = {executor.submit(analyze_trader, entry): entry for entry in leaderboard}
+        for future in as_completed(futures):
+            entry = futures[future]
+            try:
+                result = future.result()
+                if result and "skip" not in result:
+                    analyzed_traders.append(result)
+                else:
+                    pass # _safe_print(f"  Skipping {entry.get('userName') or entry.get('proxyWallet')[:8]}...: {result.get('skip')}")
+            except (RateLimited, FetchError) as e:
+                _safe_print(f"  Error analyzing {entry.get('userName') or entry.get('proxyWallet')[:8]}...: {e}")
 
-    _safe_print(f"\nFiltering complete:")
-    _safe_print(f"  - Traders checked: {total}")
-    _safe_print(f"  - Skipped (no wallet): {skipped['no_wallet']}")
-    _safe_print(f"  - Skipped (trade count outside {MIN_TRADES_PER_WEEK}-{MAX_TRADES_PER_WEEK}): {skipped['trade_count']}")
-    _safe_print(f"  - Skipped (profit rate < {MIN_PROFIT_RATE*100:.0f}%): {skipped['low_profit']}")
-    _safe_print(f"  - Skipped (profit rate > {MAX_PROFIT_RATE*100:.0f}%, likely bad data): {skipped['implausible_profit_rate']}")
-    _safe_print(f"  - Skipped (sample size < {MIN_SAMPLE_SIZE}): {skipped['small_sample']}")
-    _safe_print(f"  - Skipped (win rate < {MIN_WIN_RATE:.0f}%): {skipped['low_winrate']}")
-    _safe_print(f"  - Skipped (not enough hold-time data): {skipped['insufficient_hold_data']}")
-    _safe_print(f"  - Skipped (hold-time data covers < {MIN_HOLD_COVERAGE*100:.0f}% of trades): {skipped['unreliable_hold_data']}")
-    _safe_print(f"  - Skipped (holding time < {MIN_HOLD_DAYS} days, too fast to copy): {skipped['too_fast_to_copy']}")
-    _safe_print(f"  - Skipped (holding time > {MAX_HOLD_DAYS} days): {skipped['high_hold']}")
-    _safe_print(f"  - Skipped (avg loss > {MAX_LOSS_TO_WIN_RATIO}x avg win): {skipped['risky_loss_ratio']}")
-    _safe_print(f"  - Passed ALL filters: {len(filtered_traders)}")
+    _safe_print(f"  {len(analyzed_traders)} traders passed initial filters.")
 
-    # ----------------------------------------------------------------
-    # Score: computed HERE, not per-trader, because normalizing each
-    # metric needs the min/max across the whole surviving pool.
-    # ----------------------------------------------------------------
-    def _normalize(value, lo, hi):
-        if hi == lo:
-            return 1.0  # everyone tied on this metric — don't penalize anyone
-        return (value - lo) / (hi - lo)
+    if not analyzed_traders:
+        _safe_print("No traders passed all filters. Exiting.")
+        return
 
-    if filtered_traders:
-        # RR: traders with zero losses have RR=None. Give them the best
-        # (highest) finite RR seen in the pool — zero losses is at least
-        # as good as the best observed win/loss ratio, not "unscored."
-        finite_rrs = [r["RR"] for r in filtered_traders if r["RR"] is not None]
-        best_rr = max(finite_rrs) if finite_rrs else 1.0
-        for r in filtered_traders:
-            if r["RR"] is None:
-                r["RR"] = best_rr
+    # 4. Normalize metrics and compute composite Score
+    _safe_print("Normalizing metrics and computing scores...")
+    # Extract all values for normalization
+    profit_rates = [t["ProfitRate"] for t in analyzed_traders]
+    win_rates = [t["WinRate"] for t in analyzed_traders]
+    rrs = [t["RR"] for t in analyzed_traders if t["RR"] is not None]
+    avg_holds = [t["AvgHoldingDays"] for t in analyzed_traders]
+    sample_sizes = [t["SampleSize"] for t in analyzed_traders]
+    market_counts = [t["MarketCount"] for t in analyzed_traders]
 
-        profit_vals = [r["ProfitRate"] for r in filtered_traders]
-        win_vals = [r["WinRate"] for r in filtered_traders]
-        rr_vals = [r["RR"] for r in filtered_traders]
-        hold_vals = [r["AvgHoldingDays"] for r in filtered_traders]
-        sample_vals = [r["sample"] for r in filtered_traders]
-        market_vals = [r["MarketCount"] for r in filtered_traders]
+    # Min-Max Normalization helper
+    def normalize(value, min_val, max_val):
+        if max_val == min_val: return 0.0
+        return (value - min_val) / (max_val - min_val)
 
-        p_lo, p_hi = min(profit_vals), max(profit_vals)
-        w_lo, w_hi = min(win_vals), max(win_vals)
-        r_lo, r_hi = min(rr_vals), max(rr_vals)
-        h_lo, h_hi = min(hold_vals), max(hold_vals)
-        s_lo, s_hi = min(sample_vals), max(sample_vals)
-        m_lo, m_hi = min(market_vals), max(market_vals)
+    min_pr, max_pr = min(profit_rates), max(profit_rates)
+    min_wr, max_wr = min(win_rates), max(win_rates)
+    min_rr, max_rr = min(rrs), max(rrs) if rrs else 0
+    min_hold, max_hold = min(avg_holds), max(avg_holds)
+    min_sample, max_sample = min(sample_sizes), max(sample_sizes)
+    min_market, max_market = min(market_counts), max(market_counts)
 
-        for r in filtered_traders:
-            norm_profit = _normalize(r["ProfitRate"], p_lo, p_hi)
-            norm_win = _normalize(r["WinRate"], w_lo, w_hi)
-            norm_rr = _normalize(r["RR"], r_lo, r_hi)
-            norm_hold = 1 - _normalize(r["AvgHoldingDays"], h_lo, h_hi)  # lower hold = better
-            norm_sample = _normalize(r["sample"], s_lo, s_hi)
-            norm_market = _normalize(r["MarketCount"], m_lo, m_hi)
-            r["Score"] = round(
-                WEIGHT_PROFIT_RATE * norm_profit +
-                WEIGHT_WIN_RATE * norm_win +
-                WEIGHT_RR * norm_rr +
-                WEIGHT_HOLD * norm_hold +
-                WEIGHT_SAMPLE_SIZE * norm_sample +
-                WEIGHT_MARKET_COUNT * norm_market,
-                4,
-            )
+    for trader in analyzed_traders:
+        norm_pr = normalize(trader["ProfitRate"], min_pr, max_pr)
+        norm_wr = normalize(trader["WinRate"], min_wr, max_wr)
+        norm_rr = normalize(trader["RR"], min_rr, max_rr) if trader["RR"] is not None else 0.0
+        # For hold time, lower is generally better (within limits), so invert normalization
+        norm_hold = 1.0 - normalize(trader["AvgHoldingDays"], min_hold, max_hold)
+        norm_sample = normalize(trader["SampleSize"], min_sample, max_sample)
+        norm_market = normalize(trader["MarketCount"], min_market, max_market)
 
-    # rank by composite Score descending
-    filtered_traders.sort(key=lambda r: r.get("Score", 0), reverse=True)
+        trader["Score"] = (
+            norm_pr * WEIGHT_PROFIT_RATE +
+            norm_wr * WEIGHT_WIN_RATE +
+            norm_rr * WEIGHT_RR +
+            norm_hold * WEIGHT_HOLD +
+            norm_sample * WEIGHT_SAMPLE_SIZE +
+            norm_market * WEIGHT_MARKET_COUNT
+        )
 
-    # write CSV
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
-    out = f"traders_{stamp}.csv"
-    cols = ["Name", "TraderID", "WeeklyTrades", "ProfitRate", "WinRate", "RR",
-            "AvgWin", "AvgLoss", "AvgHoldingDays", "MarketCount", "Score"]
-    with open(out, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        for r in filtered_traders:
-            w.writerow({c: r[c] for c in cols})
+    # Sort by Score (descending)
+    analyzed_traders.sort(key=lambda x: x["Score"], reverse=True)
 
-    incomplete = sum(1 for r in filtered_traders if not r["_complete"])
-    _safe_print(f"\nDone. Wrote {len(filtered_traders)} traders -> {out}")
-    if incomplete:
-        _safe_print(f"WARNING: {incomplete} trader(s) had INCOMPLETE data.")
-    else:
-        _safe_print("All traders fetched cleanly.")
+    # 5. Write survivors to a CSV
+    output_filename = f"traders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    _safe_print(f"Writing {len(analyzed_traders)} traders to {output_filename}...")
+    if analyzed_traders:
+        fieldnames = analyzed_traders[0].keys()
+        with open(output_filename, "w", newline="") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(analyzed_traders)
+
+    end_time = time.monotonic()
+    _safe_print(f"Analysis complete in {end_time - start_time:.2f} seconds.")
 
 if __name__ == "__main__":
+    # If run directly, allow overriding POOL size for testing
+    if len(sys.argv) > 1:
+        try:
+            POOL = int(sys.argv[1])
+        except ValueError:
+            _safe_print("Invalid pool size. Using default.")
     main()
