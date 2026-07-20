@@ -91,10 +91,16 @@ jobs:
           git diff --staged --quiet && echo "No changes to commit" || git commit -m "Update latest_traders.csv ($LATEST)"
           git push
 
-      - name: Send daily Telegram digest
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python3 send_digest.py
-        
+    - name: Generate AI Summary
+      env:
+        GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      run: |
+        python3 -c "import ai_analyst; print(ai_analyst.analyze_latest_traders_for_digest())" > ai_summary.txt
+
+    - name: Send daily Telegram digest
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      run: |
+        python3 send_digest.py
