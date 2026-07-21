@@ -147,6 +147,47 @@ def get_trader_analysis(identifier, search_depth=DEFAULT_SEARCH_DEPTH):
         )
     return msg
 
-# The main function is removed as this file will be imported as a module.
-# def main():
-#    ...
+def send_telegram(text):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID saknas — skickar inget, skriver bara ut.")
+        return
+    url = TELEGRAM_API.format(token=token)
+    data = urlencode({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }).encode()
+    req = Request(url, data=data)
+    try:
+        with urlopen(req, timeout=20) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        if not result.get("ok"):
+            print(f"Telegram-sändning misslyckades: {result}")
+    except Exception as e:
+        print(f"Telegram-sändning misslyckades: {e}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 lookup_trader.py <username_or_wallet> [search_depth]")
+        sys.exit(1)
+
+    identifier = sys.argv[1]
+    search_depth = DEFAULT_SEARCH_DEPTH
+    if len(sys.argv) > 2:
+        try:
+            search_depth = int(sys.argv[2])
+        except ValueError:
+            pass
+    search_depth = max(1, min(search_depth, MAX_SEARCH_DEPTH))
+
+    msg = get_trader_analysis(identifier, search_depth)
+    print(msg)
+    send_telegram(msg)
+
+
+if __name__ == "__main__":
+    main()
