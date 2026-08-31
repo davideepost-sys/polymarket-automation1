@@ -15,7 +15,7 @@ def get_ai_response_for_summary(prompt, system_prompt="Du är en expert på trad
     }
     
     data = {
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
@@ -24,7 +24,7 @@ def get_ai_response_for_summary(prompt, system_prompt="Du är en expert på trad
         "max_tokens": 1024
     }
 
-    req = Request(url, data=json.dumps(data ).encode(), headers=headers)
+    req = Request(url, data=json.dumps(data).encode(), headers=headers)
     try:
         with urlopen(req) as resp:
             result = json.loads(resp.read().decode())
