@@ -2,7 +2,7 @@ import os
 import logging
 import csv
 import json
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, HTTPError
 from urllib.parse import urlencode
 import requests
 
@@ -26,14 +26,24 @@ def get_ai_response(prompt, system_prompt="Du är en hjälpsam AI-assistent.", c
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     messages = [{"role": "system", "content": system_prompt}]
-    if chat_history: messages.extend(chat_history )
+    if chat_history: messages.extend(chat_history)
     messages.append({"role": "user", "content": prompt})
-    data = {"model": "llama-3.3-70b-versatile", "messages": messages, "temperature": 0.7, "max_tokens": 1024}
+    
+    # Model updated to open-source developer tier model
+    data = {"model": "openai/gpt-oss-120b", "messages": messages, "temperature": 0.7, "max_tokens": 1024}
     req = Request(url, data=json.dumps(data).encode(), headers=headers)
     try:
         with urlopen(req) as resp:
             return json.loads(resp.read().decode())["choices"][0]["message"]["content"]
-    except Exception as e: return f"AI-fel: {e}"
+    except HTTPError as e:
+        # Returns exact Groq API error message if an HTTP error occurs
+        try:
+            err_body = json.loads(e.read().decode())
+            return f"AI-fel (HTTP {e.code}): {err_body.get('error', {}).get('message', str(e))}"
+        except Exception:
+            return f"AI-fel: HTTP {e.code} - {e.reason}"
+    except Exception as e: 
+        return f"AI-fel: {e}"
 
 def trigger_github_workflow(workflow_id, inputs=None):
     github_token = os.environ.get("HEY_GITHUB_PAT")
@@ -41,7 +51,7 @@ def trigger_github_workflow(workflow_id, inputs=None):
     headers = {"Authorization": f"token {github_token}", "Accept": "application/vnd.github.v3+json"}
     data = {"ref": "main", "inputs": inputs if inputs else {}}
     try:
-        response = requests.post(url, headers=headers, json=data )
+        response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()
         return True, "Workflow triggad!"
     except Exception as e: return False, f"Fel: {e}"
@@ -51,7 +61,7 @@ def get_latest_workflow_run_status(workflow_id):
     url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/actions/workflows/{workflow_id}/runs"
     headers = {"Authorization": f"token {github_token}", "Accept": "application/vnd.github.v3+json"}
     try:
-        response = requests.get(url, headers=headers )
+        response = requests.get(url, headers=headers)
         runs = response.json().get("workflow_runs")
         if runs:
             r = runs[0]
