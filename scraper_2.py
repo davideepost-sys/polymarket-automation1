@@ -73,7 +73,6 @@ USER_AGENT = "polymarket-minimal/2.1"
 
 # ---- knobs ---------------------------------------------------------------
 POOL = 500
-SHORTLIST_SIZE = 3
 CLOSED_POSITIONS_LIMIT = 300     # "last 300 closed positions"
 CLOSED_PAGE_SIZE = 50
 CLOSED_MAX_PAGES = CLOSED_POSITIONS_LIMIT // CLOSED_PAGE_SIZE  # 6 pages
@@ -554,13 +553,10 @@ def main():
     # rank by composite Score descending
     filtered_traders.sort(key=lambda r: r.get("Score", 0), reverse=True)
 
-    # Rank all technically passing traders first.
+    # Rank all technically passing traders.
+    # There is deliberately NO cap on the public CSV.
+    # The digest may highlight the top three, but all passing traders remain visible.
     filtered_traders.sort(key=lambda r: r.get("Score", 0), reverse=True)
-
-    # Prefer real usernames in the short user-facing output.
-    verified = [r for r in filtered_traders if has_verified_username(r)]
-    unverified = [r for r in filtered_traders if not has_verified_username(r)]
-    shortlist = (verified + unverified)[:SHORTLIST_SIZE]
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     audit_out = f"audit_traders_{stamp}.csv"
@@ -577,7 +573,7 @@ def main():
     with open(public_out, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
-        for r in shortlist:
+        for r in filtered_traders:
             w.writerow({c: r[c] for c in cols})
 
     incomplete = sum(1 for r in filtered_traders if not r["_complete"])
@@ -585,7 +581,7 @@ def main():
         f"\nDone. Wrote {len(filtered_traders)} passing traders -> {audit_out}"
     )
     _safe_print(
-        f"Wrote {len(shortlist)} user-facing shortlist traders -> {public_out}"
+        f"Wrote {len(filtered_traders)} user-facing passing traders -> {public_out}"
     )
     if incomplete:
         _safe_print(f"WARNING: {incomplete} trader(s) had INCOMPLETE data.")
