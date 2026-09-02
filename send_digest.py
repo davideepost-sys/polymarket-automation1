@@ -1,72 +1,138 @@
-import os
-import sys
 import csv
 import glob
-import json
 import html
-from urllib.request import Request, urlopen
+import json
+import os
+import sys
 from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+AI_UNAVAILABLE_PREFIX = "AI_UNAVAILABLE:"
 
-def latest_csv( ):
+
+def latest_csv():
     files = sorted(glob.glob("traders_*.csv"))
     return files[-1] if files else None
 
+
 def has_real_username(name):
-    return not (name.startswith("0x") and name.endswith("…"))
+    return bool(name) and not (
+        name.startswith("0x") and (name.endswith("…") or "-" in name)
+    )
+
+
+def read_ai_summary():
+    """Return a usable AI summary, or None when the AI step failed."""
+    path = "ai_summary.txt"
+
+    if not os.path.exists(path):
+        return None
+
+    with open(path, "r", encoding="utf-8") as file:
+        summary = file.read().strip()
+
+    if not summary or summary.startswith(AI_UNAVAILABLE_PREFIX):
+        return None
+
+    return summary
+
+
+def safe_value(row, column, fallback="N/A"):
+    value = row.get(column, "")
+    return value if value not in (None, "") else fallback
+
 
 def build_message(path):
     msg_parts = []
-    
-    # Lägg till AI-sammanfattning om den finns
-    if os.path.exists("ai_summary.txt"):
-        with open("ai_summary.txt", "r") as f:
-            msg_parts.append(f"<b>🤖 AI ANALYS:</b>\n{f.read()}\n")
+    ai_summary = read_ai_summary()
 
-    with open(path, newline="") as f:
-        rows = list(csv.DictReader(f))
-    
-    if not rows:
-        msg_parts.append("Hej, ny dag nya möjligheter! Inga traders klarade filtren idag.")
+    if ai_summary:
+        msg_parts.append(
+            f"<b>AI-ANALYS:</b>\n{html.escape(ai_summary)}\n"
+        )
     else:
-        msg_parts.append("<b>📊 DAGENS TRADERS:</b>\n")
-        for i, r in enumerate(rows, 1):
-            name = r["Name"]
-            safe_name = html.escape(name)
-            if has_real_username(name):
-                header = f'{i}. <a href="https://polymarket.com/@{name}"><b>{safe_name}</b></a>'
-            else:
-                header = f"{i}. <b>{safe_name}</b>"
-            msg_parts.append(
-                f"{header}\n"
-                f' PR: {float(r["ProfitRate"] )*100:.1f}% | WR: {r["WinRate"]}% | RR: {r["RR"]}\n'
+        msg_parts.append(
+            "<b>AI-ANALYS:</b> kunde inte hämtas denna körning. "
+            "Traderdata nedan är fortfarande tillgänglig.\n"
+        )
+
+    with open(path, newline="", encoding="utf-8-sig") as file:
+        rows = list(csv.DictReader(file))
+
+    if not rows:
+        msg_parts.append("Dagens körning gav inga traders som klarade filtren.")
+        return "\n".join(msg_parts)
+
+    msg_parts.append("<b>DAGENS TRADERS:</b>\n")
+
+    for index, row in enumerate(rows, 1):
+        name = safe_value(row, "Name")
+        safe_name = html.escape(name)
+
+        if has_real_username(name):
+            header = (
+                f'{index}. <a href="https://polymarket.com/@{safe_name}">'
+                f"<b>{safe_name}</b></a>"
             )
+        else:
+            header = f"{index}. <b>{safe_name}</b>"
+
+        msg_parts.append(
+            f"{header}\n"
+            f" PR: {safe_value(row, 'ProfitRate')} | "
+            f"WR: {safe_value(row, 'WinRate')} | "
+            f"RR: {safe_value(row, 'RR')}\n"
+        )
+
     return "\n".join(msg_parts)
 
+
 def send(text, token, chat_id):
+    if not token or not chat_id:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN eller TELEGRAM_CHAT_ID saknas"
+        )
+
     url = TELEGRAM_API.format(token=token)
-    data = urlencode({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode()
-    req = Request(url, data=data)
-    with urlopen(req, timeout=20) as resp:
-        result = json.loads(resp.read().decode())
-        if not result.get("ok"):
-            raise RuntimeError(f"Telegram send failed: {result}")
+
+    data = urlencode(
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
+    ).encode("utf-8")
+
+    request = Request(
+        url,
+        data=data,
+        headers={"User-Agent": "PolyGunAssistant/1.0"},
+        method="POST",
+    )
+
+    with urlopen(request, timeout=20) as response:
+        result = json.loads(response.read().decode("utf-8"))
+
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram send failed: {result}")
+
 
 def main():
+    path = latest_csv()
+
+    if not path:
+        print("Ingen traders_*.csv hittades — inget digestmeddelande skickat.")
+        sys.exit(1)
+
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    path = latest_csv()
-    if not path:
-        sys.exit(1)
-    
-    msg = build_message(path)
-    send(msg, token, chat_id)
+    message = build_message(path)
+
+    send(message, token, chat_id)
+    print(f"Digest skickad från {path}")
+
 
 if __name__ == "__main__":
     main()
