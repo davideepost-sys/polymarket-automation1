@@ -1,52 +1,110 @@
-import os
 import csv
 import json
+import os
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-def get_ai_response_for_summary(prompt, system_prompt="Du är en expert på trading och Polymarket och sammanfattar dagens topp-traders."):
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "openai/gpt-oss-20b"
+USER_AGENT = "PolyGunAssistant/1.0"
+REQUEST_TIMEOUT_SECONDS = 30
+
+
+def _error_message(prefix, message):
+    """Return a short, non-secret status marker for the digest workflow."""
+    clean = " ".join(str(message).split())
+    return f"AI_UNAVAILABLE: {prefix}: {clean[:300]}"
+
+
+def get_ai_response_for_summary(
+    prompt,
+    system_prompt="Du är en expert på trading och Polymarket och sammanfattar dagens topptraders.",
+):
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        return "Fel: GROQ_API_KEY saknas."
+        return _error_message(
+            "GROQ_API_KEY saknas",
+            "kontrollera GitHub Secret GROQ_API_KEY",
+        )
 
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    data = {
-        "model": "openai/gpt-oss-120b",
+    payload = {
+        "model": GROQ_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ],
         "temperature": 0.7,
-        "max_tokens": 1024
+        "max_tokens": 1024,
     }
 
-    req = Request(url, data=json.dumps(data).encode(), headers=headers)
+    request = Request(
+        GROQ_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+
     try:
-        with urlopen(req) as resp:
-            result = json.loads(resp.read().decode())
-            return result["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"AI-fel: {str(e)}"
+        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        content = result.get("choices", [{}])[0].get("message", {}).get("content")
+        if not content:
+            return _error_message(
+                "tomt AI-svar",
+                "Groq returnerade inget textinnehåll",
+            )
+
+        return content.strip()
+
+    except HTTPError as error:
+        try:
+            body = json.loads(error.read().decode("utf-8", "replace"))
+            message = body.get("error", {}).get("message", error.reason)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            message = error.reason
+
+        return _error_message(f"HTTP {error.code}", message)
+
+    except (URLError, TimeoutError) as error:
+        return _error_message("anslutningsfel", error)
+
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+        return _error_message("ogiltigt Groq-svar", error)
+
+    except Exception as error:
+        return _error_message("oväntat fel", error)
+
 
 def analyze_latest_traders_for_digest():
-    if not os.path.exists("latest_traders.csv"):
-        return "Ingen data hittades att analysera för daglig sammanfattning."
+    csv_path = "latest_traders.csv"
 
-    with open("latest_traders.csv", "r") as f:
-        reader = csv.DictReader(f)
-        traders = list(reader)[:5] # Analysera topp 5 för att spara tokens
+    if not os.path.exists(csv_path):
+        return _error_message("CSV saknas", csv_path)
+
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as file:
+        traders = list(csv.DictReader(file))[:5]
 
     if not traders:
-        return "Inga traders i latest_traders.csv att sammanfatta."
+        return _error_message("CSV tom", csv_path)
 
-    trader_data = json.dumps(traders, indent=2)
-    prompt = f"Här är dagens topp-traders från Polymarket:\n{trader_data}\n\nGe en kort, proffsig sammanfattning på svenska om vem som ser mest lovande ut och varför. Fokusera på WinRate och ProfitRate."
-    
+    trader_data = json.dumps(traders, ensure_ascii=False, indent=2)
+
+    prompt = (
+        "Här är dagens topp-traders från Polymarket i CSV-format:\n"
+        f"{trader_data}\n\n"
+        "Ge en kort, professionell sammanfattning på svenska av vilka som ser mest lovande ut "
+        "och varför. Använd endast uppgifterna i CSV:n. Fokusera på ProfitRate, WinRate, RR, "
+        "AvgWin, AvgLoss och AvgHoldingDays. Hitta inte på saknade värden; skriv N/A när ett "
+        "fält saknas. Skriv inte investeringsråd och kalla inte en trader säker eller garanterad."
+    )
+
     return get_ai_response_for_summary(prompt)
+
 
 if __name__ == "__main__":
     print(analyze_latest_traders_for_digest())
