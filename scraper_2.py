@@ -72,7 +72,8 @@ DATA_API = "https://data-api.polymarket.com"
 USER_AGENT = "polymarket-minimal/2.1"
 
 # ---- knobs ---------------------------------------------------------------
-POOL = 1000
+POOL = 500
+SHORTLIST_SIZE = 3
 CLOSED_POSITIONS_LIMIT = 300     # "last 300 closed positions"
 CLOSED_PAGE_SIZE = 50
 CLOSED_MAX_PAGES = CLOSED_POSITIONS_LIMIT // CLOSED_PAGE_SIZE  # 6 pages
@@ -88,12 +89,12 @@ MIN_SAMPLE_SIZE = 30            # was 10 — a 75% win rate on 11 trades is nois
 MIN_PROFIT_RATE = 0.10
 MAX_PROFIT_RATE = 2.00          # sanity ceiling: 200%+ weekly return on volume is
                                  # almost never real skill — reject as a probable data glitch
-MIN_WIN_RATE = 75.0
+MIN_WIN_RATE = 60.0
 MIN_HOLD_DAYS = 0.02            # ~29 minutes. Below this, a trade closes
                                  # faster than a copy-bot can realistically
                                  # react — reject even if the number is real,
                                  # since it's not something you can copy.
-MAX_HOLD_DAYS = 1.5
+MAX_HOLD_DAYS = 2.0
 MIN_HOLD_COVERAGE = 0.30        # matched hold-times must cover at least 30% of a
                                  # trader's decided trades, or the average isn't trustworthy
 MAX_LOSS_TO_WIN_RATIO = 2.0     # reject if the average loss is more than 2x the
@@ -242,7 +243,12 @@ def analyze_trader(entry):
     the trader doesn't pass filters. Thread-safe — no shared mutable state.
     """
     wallet = entry.get("proxyWallet")
-    name = entry.get("userName") or entry.get("xUsername") or (wallet[:8] + "…")
+    username = entry.get("userName") or entry.get("xUsername")
+    name = (
+        username.strip()
+        if isinstance(username, str) and username.strip()
+        else (wallet[:8] + "…")
+    )
     if not wallet:
         return None
 
@@ -405,6 +411,27 @@ def analyze_trader(entry):
 # ==========================================================================
 #  Run — concurrent
 # ==========================================================================
+def deduplicate_leaderboard(rows):
+    """Keep one candidate per wallet before expensive analysis."""
+    unique_rows = []
+    seen_wallets = set()
+
+    for row in rows:
+        wallet = (row.get("proxyWallet") or "").strip().lower()
+        if not wallet or wallet in seen_wallets:
+            continue
+        seen_wallets.add(wallet)
+        unique_rows.append(row)
+
+    return unique_rows
+
+
+def has_verified_username(row):
+    """Fallback wallet labels are not verified usernames."""
+    name = str(row.get("Name") or "").strip()
+    return bool(name) and not name.startswith("0x")
+
+
 def main():
     pool = POOL
     if len(sys.argv) > 1:
@@ -417,12 +444,16 @@ def main():
     _safe_print(f"Reading top {pool} weekly traders (by PNL)")
     _safe_print(f"Using {WORKERS} parallel workers\n")
 
-    lb = get_leaderboard(pool)
-    if not lb:
+    lb_raw = get_leaderboard(pool)
+    if not lb_raw:
         _safe_print("Could not read the leaderboard. Stopping.")
         sys.exit(1)
 
-    _safe_print(f"Got {len(lb)} traders from leaderboard. Analyzing with {WORKERS} workers...\n")
+    lb = deduplicate_leaderboard(lb_raw)
+    _safe_print(
+        f"Got {len(lb_raw)} leaderboard rows and {len(lb)} unique wallets. "
+        f"Analyzing with {WORKERS} workers...\n"
+    )
 
     filtered_traders = []
     skipped = {"no_wallet": 0, "trade_count": 0, "low_profit": 0,
@@ -523,19 +554,39 @@ def main():
     # rank by composite Score descending
     filtered_traders.sort(key=lambda r: r.get("Score", 0), reverse=True)
 
-    # write CSV
+    # Rank all technically passing traders first.
+    filtered_traders.sort(key=lambda r: r.get("Score", 0), reverse=True)
+
+    # Prefer real usernames in the short user-facing output.
+    verified = [r for r in filtered_traders if has_verified_username(r)]
+    unverified = [r for r in filtered_traders if not has_verified_username(r)]
+    shortlist = (verified + unverified)[:SHORTLIST_SIZE]
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
-    out = f"traders_{stamp}.csv"
+    audit_out = f"audit_traders_{stamp}.csv"
+    public_out = f"traders_{stamp}.csv"
     cols = ["Name", "TraderID", "WeeklyTrades", "ProfitRate", "WinRate", "RR",
             "AvgWin", "AvgLoss", "AvgHoldingDays", "MarketCount", "Score"]
-    with open(out, "w", newline="") as f:
+
+    with open(audit_out, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         for r in filtered_traders:
             w.writerow({c: r[c] for c in cols})
 
+    with open(public_out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in shortlist:
+            w.writerow({c: r[c] for c in cols})
+
     incomplete = sum(1 for r in filtered_traders if not r["_complete"])
-    _safe_print(f"\nDone. Wrote {len(filtered_traders)} traders -> {out}")
+    _safe_print(
+        f"\nDone. Wrote {len(filtered_traders)} passing traders -> {audit_out}"
+    )
+    _safe_print(
+        f"Wrote {len(shortlist)} user-facing shortlist traders -> {public_out}"
+    )
     if incomplete:
         _safe_print(f"WARNING: {incomplete} trader(s) had INCOMPLETE data.")
     else:
