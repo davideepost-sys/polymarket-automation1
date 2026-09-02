@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       pool_size:
-        description: 'Number of top traders to analyze (default: 1000)'
+        description: 'Number of top traders to analyze (default: 500)'
         required: false
-        default: '1000'
+        default: '500'
         type: string
   schedule:
     - cron: '0 6 * * *'
@@ -33,7 +33,7 @@ jobs:
 
       - name: Run Polymarket Analyzer
         run: |
-          python3 scraper_2.py ${{ github.event.inputs.pool_size || '1000' }}
+          python3 scraper_2.py ${{ github.event.inputs.pool_size || '500' }}
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
