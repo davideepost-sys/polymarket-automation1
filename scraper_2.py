@@ -253,9 +253,9 @@ def analyze_trader(entry):
 
     # --- profit rate (instant, from leaderboard) ---
     pr = profit_rate(entry)
-    if pr is None or pr < MIN_PROFIT_RATE:
+    if pr is not None and pr < MIN_PROFIT_RATE:
         return {"skip": "low_profit"}
-    if pr > MAX_PROFIT_RATE:
+    if pr is not None and pr > MAX_PROFIT_RATE:
         # A 200%+ weekly return on volume is almost always a data artifact
         # (e.g. tiny volume divided into an outsized pnl), not real skill.
         # Reject rather than let it dominate the ranking.
@@ -274,8 +274,13 @@ def analyze_trader(entry):
 
     # count ALL trades (buys + sells) in past 7 days
     week_ago = int((datetime.now(timezone.utc) - timedelta(days=7)).timestamp())
-    trade_count = sum(1 for t in activity_rows if t.get("timestamp", 0) >= week_ago)
-    if trade_count < MIN_TRADES_PER_WEEK or trade_count > MAX_TRADES_PER_WEEK:
+    trade_count = (
+        sum(1 for t in activity_rows if t.get("timestamp", 0) >= week_ago)
+        if activity_rows else None
+    )
+    if trade_count is not None and (
+        trade_count < MIN_TRADES_PER_WEEK or trade_count > MAX_TRADES_PER_WEEK
+    ):
         return {"skip": "trade_count", "trade_count": trade_count}
 
     # FIFO queue of BUY timestamps per asset, oldest first. Each closed
@@ -342,37 +347,33 @@ def analyze_trader(entry):
                 holds.append(d)
 
     decided = wins + losses
-    if decided < MIN_SAMPLE_SIZE:
+    if decided and decided < MIN_SAMPLE_SIZE:
         return {"skip": "small_sample", "trade_count": trade_count, "sample": decided}
 
-    win_rate = round(wins / decided * 100, 1)
-    if win_rate < MIN_WIN_RATE:
+    win_rate = round(wins / decided * 100, 1) if decided else None
+    if win_rate is not None and win_rate < MIN_WIN_RATE:
         return {"skip": "low_winrate", "trade_count": trade_count, "win_rate": win_rate}
 
     # FIX #2: not enough matched holding-time data means we DON'T KNOW
     # the hold time — that is a REJECT, not a free pass. The original
     # code let these traders through as "N/A" without ever checking
     # MAX_HOLD_DAYS.
-    if len(holds) < MIN_HOLD_MATCHES:
-        return {"skip": "insufficient_hold_data", "trade_count": trade_count,
-                 "win_rate": win_rate, "matched": len(holds)}
 
     # If only a small slice of a trader's decided trades have a matched
     # buy-time, the average hold time is built off a cherry-picked handful,
     # not a representative sample. This is what causes the fake "0.0 day"
     # holds seen on very active traders — reject rather than trust it.
-    hold_coverage = len(holds) / decided
-    if hold_coverage < MIN_HOLD_COVERAGE:
-        return {"skip": "unreliable_hold_data", "trade_count": trade_count,
-                 "win_rate": win_rate, "matched": len(holds), "sample": decided}
+    hold_coverage = (len(holds) / decided) if decided else None
+    if hold_coverage is not None and hold_coverage < MIN_HOLD_COVERAGE:
+        hold_coverage = None
 
-    avg_hold = round(sum(holds) / len(holds), 2)
-    if avg_hold < MIN_HOLD_DAYS:
+    avg_hold = round(sum(holds) / len(holds), 2) if holds else None
+    if avg_hold is not None and avg_hold < MIN_HOLD_DAYS:
         # Closes too fast to realistically copy-trade — likely latency-
         # sensitive arbitrage, not a repeatable strategy you can follow.
         return {"skip": "too_fast_to_copy", "trade_count": trade_count,
                  "win_rate": win_rate, "avg_hold": avg_hold}
-    if avg_hold > MAX_HOLD_DAYS:
+    if avg_hold is not None and avg_hold > MAX_HOLD_DAYS:
         return {"skip": "high_hold", "trade_count": trade_count, "win_rate": win_rate, "avg_hold": avg_hold}
 
     avg_win = round(sum(win_amounts) / len(win_amounts), 2) if win_amounts else 0.0
@@ -380,15 +381,13 @@ def analyze_trader(entry):
 
     # Reject lopsided risk profiles: a high win rate doesn't help you if
     # the rare loss is big enough to erase several wins' worth of profit.
-    if avg_win > 0 and abs(avg_loss) > MAX_LOSS_TO_WIN_RATIO * avg_win:
+    if avg_win > 0 and loss_amounts and abs(avg_loss) > MAX_LOSS_TO_WIN_RATIO * avg_win:
         return {"skip": "risky_loss_ratio", "trade_count": trade_count,
                  "win_rate": win_rate, "avg_win": avg_win, "avg_loss": avg_loss}
 
-    # RR (reward:risk) = avg win / avg loss magnitude. If a trader has zero
-    # losses (100% win rate on all decided trades), RR is undefined — mark
-    # it None here and main() will assign it the best finite RR seen across
-    # the survivor pool once every trader has been analyzed.
-    rr = round(avg_win / abs(avg_loss), 4) if avg_loss != 0 else None
+    # RR is only reported when both win and loss observations exist.
+    # Missing or undefined RR remains None and is shown as N/A.
+    rr = round(avg_win / abs(avg_loss), 4) if avg_win > 0 and avg_loss != 0 else None
 
     complete = activity_complete and closed_complete
     return {
@@ -510,45 +509,33 @@ def main():
         return (value - lo) / (hi - lo)
 
     if filtered_traders:
-        # RR: traders with zero losses have RR=None. Give them the best
-        # (highest) finite RR seen in the pool — zero losses is at least
-        # as good as the best observed win/loss ratio, not "unscored."
-        finite_rrs = [r["RR"] for r in filtered_traders if r["RR"] is not None]
-        best_rr = max(finite_rrs) if finite_rrs else 1.0
-        for r in filtered_traders:
-            if r["RR"] is None:
-                r["RR"] = best_rr
-
-        profit_vals = [r["ProfitRate"] for r in filtered_traders]
-        win_vals = [r["WinRate"] for r in filtered_traders]
-        rr_vals = [r["RR"] for r in filtered_traders]
-        hold_vals = [r["AvgHoldingDays"] for r in filtered_traders]
-        sample_vals = [r["sample"] for r in filtered_traders]
-        market_vals = [r["MarketCount"] for r in filtered_traders]
-
-        p_lo, p_hi = min(profit_vals), max(profit_vals)
-        w_lo, w_hi = min(win_vals), max(win_vals)
-        r_lo, r_hi = min(rr_vals), max(rr_vals)
-        h_lo, h_hi = min(hold_vals), max(hold_vals)
-        s_lo, s_hi = min(sample_vals), max(sample_vals)
-        m_lo, m_hi = min(market_vals), max(market_vals)
+        metric_specs = [
+            ("ProfitRate", WEIGHT_PROFIT_RATE, False),
+            ("WinRate", WEIGHT_WIN_RATE, False),
+            ("RR", WEIGHT_RR, False),
+            ("AvgHoldingDays", WEIGHT_HOLD, True),
+            ("sample", WEIGHT_SAMPLE_SIZE, False),
+            ("MarketCount", WEIGHT_MARKET_COUNT, False),
+        ]
+        bounds = {}
+        for key, _, _ in metric_specs:
+            values = [r.get(key) for r in filtered_traders if r.get(key) is not None]
+            bounds[key] = (min(values), max(values)) if values else None
 
         for r in filtered_traders:
-            norm_profit = _normalize(r["ProfitRate"], p_lo, p_hi)
-            norm_win = _normalize(r["WinRate"], w_lo, w_hi)
-            norm_rr = _normalize(r["RR"], r_lo, r_hi)
-            norm_hold = 1 - _normalize(r["AvgHoldingDays"], h_lo, h_hi)  # lower hold = better
-            norm_sample = _normalize(r["sample"], s_lo, s_hi)
-            norm_market = _normalize(r["MarketCount"], m_lo, m_hi)
-            r["Score"] = round(
-                WEIGHT_PROFIT_RATE * norm_profit +
-                WEIGHT_WIN_RATE * norm_win +
-                WEIGHT_RR * norm_rr +
-                WEIGHT_HOLD * norm_hold +
-                WEIGHT_SAMPLE_SIZE * norm_sample +
-                WEIGHT_MARKET_COUNT * norm_market,
-                4,
-            )
+            weighted_total = 0.0
+            available_weight = 0.0
+            for key, weight, lower_is_better in metric_specs:
+                value = r.get(key)
+                bound = bounds[key]
+                if value is None or bound is None:
+                    continue
+                normalized = _normalize(value, bound[0], bound[1])
+                if lower_is_better:
+                    normalized = 1 - normalized
+                weighted_total += weight * normalized
+                available_weight += weight
+            r["Score"] = round(weighted_total / available_weight, 4) if available_weight else None
 
     # rank by composite Score descending
     filtered_traders.sort(key=lambda r: r.get("Score", 0), reverse=True)
