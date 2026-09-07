@@ -8,8 +8,21 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
-AI_UNAVAILABLE_PREFIX = "AI_UNAVAILABLE:"
 TELEGRAM_MESSAGE_LIMIT = 3800
+
+AI_GUIDE = (
+    "<b>AI ÄR TILLGÄNGLIG FÖR YTTERLIGARE HJÄLP</b>\n"
+    "AI:n analyserar inte automatiskt denna lista. Be uttryckligen om hjälp i chatten.\n\n"
+    "Exempel på frågor:\n"
+    "• <i>Simulera 100 fiktiva copytrades med trader nr 1. "
+    "Startkapital 1000 USDC och 10 USDC per trade.</i>\n"
+    "• <i>Simulera trader nr 1 och nr 2 med 2 % av plånboken per trade.</i>\n"
+    "• <i>Förklara varför RR 0,65 kan vara riskfyllt och ge ett exempel.</i>\n"
+    "• <i>Jämför trader nr 1 och nr 2 utifrån PR, WR, RR, genomsnittlig vinst, "
+    "genomsnittlig förlust och holdtid.</i>\n\n"
+    "Skriv alltid startkapital och fast summa eller procent per trade vid simulering. "
+    "Scenarierna är fiktiva och är inte en prognos.\n"
+)
 
 
 def latest_csv():
@@ -23,20 +36,6 @@ def has_real_username(name):
     )
 
 
-def read_ai_summary():
-    path = "ai_summary.txt"
-    if not os.path.exists(path):
-        return None
-
-    with open(path, "r", encoding="utf-8") as file:
-        summary = file.read().strip()
-
-    if not summary or summary.startswith(AI_UNAVAILABLE_PREFIX):
-        return None
-
-    return summary
-
-
 def safe_value(row, column, fallback="N/A"):
     value = row.get(column, "")
     return value if value not in (None, "") else fallback
@@ -48,22 +47,22 @@ def format_trader(index, row):
 
     if has_real_username(name):
         header = (
-            f'{index}. <a href="https://polymarket.com/@{safe_name}">'
-            f"<b>{safe_name}</b></a>"
+            f'<b>{index}. <a href="https://polymarket.com/@{safe_name}">'
+            f"{safe_name}</a></b>"
         )
     else:
-        header = f"{index}. <b>{safe_name}</b>"
+        header = f"<b>{index}. {safe_name}</b>"
 
     marker = " <b>TOP 3</b>" if index <= 3 else ""
 
     return (
         f"{header}{marker}\n"
-        f" PR: {safe_value(row, 'ProfitRate')} | "
-        f"WR: {safe_value(row, 'WinRate')} | "
-        f"RR: {safe_value(row, 'RR')} | "
-        f"ØV: {safe_value(row, 'AvgWin')} | "
-        f"ØF: {safe_value(row, 'AvgLoss')} | "
-        f"Hold: {safe_value(row, 'AvgHoldingDays')}d\n"
+        f"  ProfitRate: {safe_value(row, 'ProfitRate')} | "
+        f"WinRate: {safe_value(row, 'WinRate')} | "
+        f"Risk/Reward (RR): {safe_value(row, 'RR')}\n"
+        f"  Genomsnittlig vinst: {safe_value(row, 'AvgWin')} | "
+        f"Genomsnittlig förlust: {safe_value(row, 'AvgLoss')} | "
+        f"Genomsnittlig holdtid: {safe_value(row, 'AvgHoldingDays')} dagar\n"
     )
 
 
@@ -71,20 +70,12 @@ def build_message_parts(path):
     with open(path, newline="", encoding="utf-8-sig") as file:
         rows = list(csv.DictReader(file))
 
-    ai_summary = read_ai_summary()
-    if ai_summary:
-        intro = f"<b>AI-ANALYS:</b>\n{html.escape(ai_summary)}\n\n"
-    else:
-        intro = (
-            "<b>AI-ANALYS:</b> kunde inte hämtas denna körning. "
-            "Traderdata nedan är fortfarande tillgänglig.\n\n"
-        )
-
+    intro = AI_GUIDE
     if not rows:
-        return [intro + "<b>DAGENS TRADERS:</b>\nInga traders klarade filtren."]
+        return [intro + "\n<b>DAGENS TRADERS:</b>\nInga traders klarade de befintliga filtren."]
 
     parts = []
-    current = intro + "<b>DAGENS TRADERS:</b>\n\n"
+    current = intro + "\n<b>DAGENS TRADERS:</b>\n\n"
 
     for index, row in enumerate(rows, 1):
         trader_text = format_trader(index, row)
@@ -103,7 +94,6 @@ def send(text, token, chat_id):
     if not token or not chat_id:
         raise RuntimeError("TELEGRAM_BOT_TOKEN eller TELEGRAM_CHAT_ID saknas")
 
-    url = TELEGRAM_API.format(token=token)
     data = urlencode(
         {
             "chat_id": chat_id,
@@ -114,7 +104,7 @@ def send(text, token, chat_id):
     ).encode("utf-8")
 
     request = Request(
-        url,
+        TELEGRAM_API.format(token=token),
         data=data,
         headers={"User-Agent": "PolyGunAssistant/1.0"},
         method="POST",
@@ -135,12 +125,11 @@ def main():
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    parts = build_message_parts(path)
 
-    for part in parts:
+    for part in build_message_parts(path):
         send(part, token, chat_id)
 
-    print(f"Digest skickad från {path} i {len(parts)} Telegrammeddelande(n)")
+    print(f"Digest skickad från {path}")
 
 
 if __name__ == "__main__":
