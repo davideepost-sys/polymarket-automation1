@@ -25,10 +25,44 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run original scraper without changing its output in GitHub
+      - name: Run original scraper and isolated ranking
         run: |
-          python3 scraper_2.py "<LaTex>{{ github.event.inputs.pool_size || '100' }}"        - name: Run isolated versatility ranking         run: |           SOURCE=</LaTex>(ls -t traders_*.csv | head -n 1)
-          python3 versatility_rank.py "<LaTex>SOURCE"        - name: Upload isolated test results         uses: actions/upload-artifact@v4         with:           name: versatility-shadow-</LaTex>{{ github.run_number }}
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          event_path = os.environ.get("GITHUB_EVENT_PATH")
+          pool_size = "100"
+          if event_path and Path(event_path).exists():
+              with open(event_path, encoding="utf-8") as handle:
+                  event = json.load(handle)
+              pool_size = str(event.get("inputs", {}).get("pool_size") or "100")
+
+          if not pool_size.isdigit() or not 1 <= int(pool_size) <= 1000:
+              raise SystemExit("pool_size must be a whole number from 1 to 1000")
+
+          subprocess.run(["python3", "scraper_2.py", pool_size], check=True)
+
+          csv_files = sorted(
+              Path(".").glob("traders_*.csv"),
+              key=lambda path: path.stat().st_mtime,
+              reverse=True,
+          )
+          if not csv_files:
+              raise SystemExit("The original scraper produced no traders_*.csv file")
+
+          subprocess.run(
+              ["python3", "versatility_rank.py", str(csv_files[0])],
+              check=True,
+          )
+          PY
+
+      - name: Upload isolated test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: versatility-shadow-results
           path: |
             traders_*.csv
             versatility_traders_*.csv
