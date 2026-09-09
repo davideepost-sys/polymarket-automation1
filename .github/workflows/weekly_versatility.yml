@@ -1,4 +1,4 @@
-name: Weekly Versatility Shadow Test
+name: Weekly Versatility Curve Test
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  versatility-shadow:
+  curve-shadow:
     runs-on: ubuntu-latest
 
     steps:
@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run original scraper and isolated ranking
+      - name: Run clean clone scraper and curve analysis
         run: |
           python3 - <<'PY'
           import json
@@ -43,28 +43,31 @@ jobs:
           if not pool_size.isdigit() or not 1 <= int(pool_size) <= 1000:
               raise SystemExit("pool_size must be a whole number from 1 to 1000")
 
-          subprocess.run(["python3", "scraper_2.py", pool_size], check=True)
+          subprocess.run(
+              ["python3", "scraper_versatility_clean.py", pool_size],
+              check=True,
+          )
 
-          csv_files = sorted(
+          source_files = sorted(
               Path(".").glob("traders_*.csv"),
               key=lambda path: path.stat().st_mtime,
               reverse=True,
           )
-          if not csv_files:
-              raise SystemExit("The original scraper produced no traders_*.csv file")
+          if not source_files:
+              raise SystemExit("The clean clone scraper produced no traders_*.csv file")
 
           subprocess.run(
-              ["python3", "versatility_rank.py", str(csv_files[0])],
+              ["python3", "versatility_rank_curve.py", str(source_files[0])],
               check=True,
           )
           PY
 
-      - name: Upload isolated test results
+      - name: Upload isolated curve results
         uses: actions/upload-artifact@v4
         with:
-          name: versatility-shadow-results
+          name: versatility-curve-results
           path: |
             traders_*.csv
-            versatility_traders_*.csv
+            versatility_curve_traders_*.csv
           retention-days: 30
           if-no-files-found: error
