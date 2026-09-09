@@ -1,0 +1,36 @@
+name: Weekly Versatility Shadow Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      pool_size:
+        description: 'Number of weekly leaderboard candidates to analyze'
+        required: false
+        default: '100'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  versatility-shadow:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run original scraper without changing its output in GitHub
+        run: |
+          python3 scraper_2.py "<LaTex>{{ github.event.inputs.pool_size || '100' }}"        - name: Run isolated versatility ranking         run: |           SOURCE=</LaTex>(ls -t traders_*.csv | head -n 1)
+          python3 versatility_rank.py "<LaTex>SOURCE"        - name: Upload isolated test results         uses: actions/upload-artifact@v4         with:           name: versatility-shadow-</LaTex>{{ github.run_number }}
+          path: |
+            traders_*.csv
+            versatility_traders_*.csv
+          retention-days: 30
+          if-no-files-found: error
