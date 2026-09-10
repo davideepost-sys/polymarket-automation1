@@ -85,7 +85,14 @@ POLITE_DELAY = 0.12
 MIN_TRADES_PER_WEEK = 21
 MAX_TRADES_PER_WEEK = 700
 MIN_SAMPLE_SIZE = 30            # was 10 — a 75% win rate on 11 trades is noise, not skill
-MIN_PROFIT_RATE = 0.10
+# Experimental net-profit floor.
+# PolyGun publishes 1% on each buy and sell = 2% round trip.
+# Polymarket taker costs vary by market/price; reserve 5% conservatively.
+POLYGUN_FEE_RESERVE = 0.02
+POLYMARKET_FEE_RESERVE = 0.05
+SAFETY_MARGIN_RESERVE = 0.00
+COST_RESERVE_RATE = POLYGUN_FEE_RESERVE + POLYMARKET_FEE_RESERVE
+MIN_PROFIT_RATE = COST_RESERVE_RATE + SAFETY_MARGIN_RESERVE
 MAX_PROFIT_RATE = 2.00          # sanity ceiling: 200%+ weekly return on volume is
                                  # almost never real skill — reject as a probable data glitch
 MIN_WIN_RATE = 75.0
@@ -459,7 +466,7 @@ def main():
     _safe_print(f"  - Traders checked: {total}")
     _safe_print(f"  - Skipped (no wallet): {skipped['no_wallet']}")
     _safe_print(f"  - Skipped (trade count outside {MIN_TRADES_PER_WEEK}-{MAX_TRADES_PER_WEEK}): {skipped['trade_count']}")
-    _safe_print(f"  - Skipped (profit rate < {MIN_PROFIT_RATE*100:.0f}%): {skipped['low_profit']}")
+    _safe_print(f"  - Skipped (profit rate < {MIN_PROFIT_RATE*100:.1f}%): {skipped['low_profit']}")
     _safe_print(f"  - Skipped (profit rate > {MAX_PROFIT_RATE*100:.0f}%, likely bad data): {skipped['implausible_profit_rate']}")
     _safe_print(f"  - Skipped (sample size < {MIN_SAMPLE_SIZE}): {skipped['small_sample']}")
     _safe_print(f"  - Skipped (win rate < {MIN_WIN_RATE:.0f}%): {skipped['low_winrate']}")
