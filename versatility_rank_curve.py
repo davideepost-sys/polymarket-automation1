@@ -36,7 +36,7 @@ USER_AGENT = "PolyGunVersatilityCurve/2.0"
 
 PAGE_SIZE = 50
 INITIAL_POSITIONS = 300
-MAX_POSITIONS = 1000
+MAX_POSITIONS = 2000
 MIN_TIME_COVERAGE_DAYS = 14.0
 MIN_UNIQUE_DAYS = 7
 MAX_RETRIES = 3
@@ -318,7 +318,7 @@ def analyze_wallet(wallet):
 
     if needs_extension and len(initial_rows) < MAX_POSITIONS:
         final_rows = fetch_closed_positions(wallet, MAX_POSITIONS)
-        final_metrics = curve_metrics(final_rows, "EXTENDED_UP_TO_1000")
+        final_metrics = curve_metrics(final_rows, "EXTENDED_UP_TO_2000")
         final_metrics["InitialPositionCount"] = initial_metrics.get("PositionCount", 0)
         final_metrics["InitialTimeSpanDays"] = initial_span
         return final_metrics
