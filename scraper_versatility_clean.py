@@ -73,9 +73,9 @@ USER_AGENT = "polymarket-minimal/2.1"
 
 # ---- knobs ---------------------------------------------------------------
 POOL = 1000
-CLOSED_POSITIONS_LIMIT = 300     # "last 300 closed positions"
+CLOSED_POSITIONS_LIMIT = 2000    # broader sample for validation; not a curve filter
 CLOSED_PAGE_SIZE = 50
-CLOSED_MAX_PAGES = CLOSED_POSITIONS_LIMIT // CLOSED_PAGE_SIZE  # 6 pages
+CLOSED_MAX_PAGES = CLOSED_POSITIONS_LIMIT // CLOSED_PAGE_SIZE  # 40 pages
 ACTIVITY_MAX_PAGES = 5          # see NOTE 6 above re: hold-time bias
 MIN_HOLD_MATCHES = 5
 MAX_RETRIES = 3
@@ -84,18 +84,18 @@ POLITE_DELAY = 0.12
 
 MIN_TRADES_PER_WEEK = 21
 MAX_TRADES_PER_WEEK = 700
-MIN_SAMPLE_SIZE = 30            # was 10 — a 75% win rate on 11 trades is noise, not skill
+MIN_SAMPLE_SIZE = 30            # keep a minimum sample, but inspect up to 2000 closed positions
 # Experimental net-profit floor.
 # PolyGun publishes 1% on each buy and sell = 2% round trip.
 # Polymarket taker costs vary by market/price; reserve 5% conservatively.
 POLYGUN_FEE_RESERVE = 0.02
-POLYMARKET_FEE_RESERVE = 0.05
+POLYMARKET_FEE_RESERVE = 0.04
 SAFETY_MARGIN_RESERVE = 0.00
 COST_RESERVE_RATE = POLYGUN_FEE_RESERVE + POLYMARKET_FEE_RESERVE
-MIN_PROFIT_RATE = COST_RESERVE_RATE + SAFETY_MARGIN_RESERVE
-MAX_PROFIT_RATE = 2.00          # sanity ceiling: 200%+ weekly return on volume is
+MIN_PROFIT_RATE = 0.06
+MAX_PROFIT_RATE = 1.00          # sanity ceiling: 200%+ weekly return on volume is
                                  # almost never real skill — reject as a probable data glitch
-MIN_WIN_RATE = 75.0
+MIN_WIN_RATE = 65.0
 MIN_HOLD_DAYS = 0.02            # ~29 minutes. Below this, a trade closes
                                  # faster than a copy-bot can realistically
                                  # react — reject even if the number is real,
@@ -355,9 +355,11 @@ def analyze_trader(entry):
     # the hold time — that is a REJECT, not a free pass. The original
     # code let these traders through as "N/A" without ever checking
     # MAX_HOLD_DAYS.
-    if len(holds) < MIN_HOLD_MATCHES:
-        return {"skip": "insufficient_hold_data", "trade_count": trade_count,
-                 "win_rate": win_rate, "matched": len(holds)}
+    hold_data_reliable = len(holds) >= MIN_HOLD_MATCHES
+
+    # If hold timestamps are missing, keep the trader for inspection instead
+    # of silently losing a potentially good trader. Hold is reported as N/A
+    # and its copy-speed filters are not applied without reliable data.
 
     # If only a small slice of a trader's decided trades have a matched
     # buy-time, the average hold time is built off a cherry-picked handful,
@@ -374,7 +376,7 @@ def analyze_trader(entry):
         # sensitive arbitrage, not a repeatable strategy you can follow.
         return {"skip": "too_fast_to_copy", "trade_count": trade_count,
                  "win_rate": win_rate, "avg_hold": avg_hold}
-    if avg_hold > MAX_HOLD_DAYS:
+    if avg_hold is not None and avg_hold > MAX_HOLD_DAYS:
         return {"skip": "high_hold", "trade_count": trade_count, "win_rate": win_rate, "avg_hold": avg_hold}
 
     avg_win = round(sum(win_amounts) / len(win_amounts), 2) if win_amounts else 0.0
@@ -407,6 +409,7 @@ def analyze_trader(entry):
         "_complete": complete,
         "sample": decided,
         "matched": len(holds),
+        "HoldDataStatus": "OK" if hold_data_reliable else "N/A - insufficient matched hold data",
     }
 
 # ==========================================================================
@@ -487,45 +490,47 @@ def main():
         return (value - lo) / (hi - lo)
 
     if filtered_traders:
-        # RR: traders with zero losses have RR=None. Give them the best
-        # (highest) finite RR seen in the pool — zero losses is at least
-        # as good as the best observed win/loss ratio, not "unscored."
         finite_rrs = [r["RR"] for r in filtered_traders if r["RR"] is not None]
         best_rr = max(finite_rrs) if finite_rrs else 1.0
         for r in filtered_traders:
             if r["RR"] is None:
                 r["RR"] = best_rr
 
-        profit_vals = [r["ProfitRate"] for r in filtered_traders]
-        win_vals = [r["WinRate"] for r in filtered_traders]
-        rr_vals = [r["RR"] for r in filtered_traders]
-        hold_vals = [r["AvgHoldingDays"] for r in filtered_traders]
-        sample_vals = [r["sample"] for r in filtered_traders]
-        market_vals = [r["MarketCount"] for r in filtered_traders]
+        def norm(value, values):
+            lo, hi = min(values), max(values)
+            return 1.0 if hi == lo else (value - lo) / (hi - lo)
 
-        p_lo, p_hi = min(profit_vals), max(profit_vals)
-        w_lo, w_hi = min(win_vals), max(win_vals)
-        r_lo, r_hi = min(rr_vals), max(rr_vals)
-        h_lo, h_hi = min(hold_vals), max(hold_vals)
-        s_lo, s_hi = min(sample_vals), max(sample_vals)
-        m_lo, m_hi = min(market_vals), max(market_vals)
+        metric_values = {
+            "ProfitRate": [r["ProfitRate"] for r in filtered_traders],
+            "WinRate": [r["WinRate"] for r in filtered_traders],
+            "RR": [r["RR"] for r in filtered_traders],
+            "sample": [r["sample"] for r in filtered_traders],
+            "MarketCount": [r["MarketCount"] for r in filtered_traders],
+        }
+        hold_values = [r["AvgHoldingDays"] for r in filtered_traders if r["AvgHoldingDays"] is not None]
+        if hold_values:
+            metric_values["AvgHoldingDays"] = hold_values
 
+        weights = {
+            "ProfitRate": WEIGHT_PROFIT_RATE,
+            "WinRate": WEIGHT_WIN_RATE,
+            "RR": WEIGHT_RR,
+            "AvgHoldingDays": WEIGHT_HOLD,
+            "sample": WEIGHT_SAMPLE_SIZE,
+            "MarketCount": WEIGHT_MARKET_COUNT,
+        }
         for r in filtered_traders:
-            norm_profit = _normalize(r["ProfitRate"], p_lo, p_hi)
-            norm_win = _normalize(r["WinRate"], w_lo, w_hi)
-            norm_rr = _normalize(r["RR"], r_lo, r_hi)
-            norm_hold = 1 - _normalize(r["AvgHoldingDays"], h_lo, h_hi)  # lower hold = better
-            norm_sample = _normalize(r["sample"], s_lo, s_hi)
-            norm_market = _normalize(r["MarketCount"], m_lo, m_hi)
-            r["Score"] = round(
-                WEIGHT_PROFIT_RATE * norm_profit +
-                WEIGHT_WIN_RATE * norm_win +
-                WEIGHT_RR * norm_rr +
-                WEIGHT_HOLD * norm_hold +
-                WEIGHT_SAMPLE_SIZE * norm_sample +
-                WEIGHT_MARKET_COUNT * norm_market,
-                4,
-            )
+            terms = []
+            for key, weight in weights.items():
+                value = r.get(key)
+                if key == "AvgHoldingDays":
+                    score_value = 1.0 - norm(value, metric_values[key]) if value is not None else None
+                else:
+                    score_value = norm(value, metric_values[key])
+                if score_value is not None:
+                    terms.append((weight, score_value))
+            total_weight = sum(weight for weight, _ in terms)
+            r["Score"] = round(sum(weight * value for weight, value in terms) / total_weight, 4) if total_weight else 0.0
 
     # rank by composite Score descending
     filtered_traders.sort(key=lambda r: r.get("Score", 0), reverse=True)
@@ -534,7 +539,7 @@ def main():
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     out = f"traders_{stamp}.csv"
     cols = ["Name", "TraderID", "WeeklyTrades", "ProfitRate", "WinRate", "RR",
-            "AvgWin", "AvgLoss", "AvgHoldingDays", "MarketCount", "Score"]
+            "AvgWin", "AvgLoss", "AvgHoldingDays", "HoldDataStatus", "MarketCount", "Score"]
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
