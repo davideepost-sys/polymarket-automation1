@@ -1,193 +1,181 @@
+#!/usr/bin/env python3
+"""Simple PolyMarket trader lookup by username or wallet/trader ID.
+
+This lookup does not require the trader to be in the daily CSV or weekly
+leaderboard. It resolves a username through public profile search, then reads
+closed positions directly and reports a compact result.
 """
-lookup_trader.py — looks up ONE trader (by username or wallet address) and
-runs the exact same analysis pipeline as scraper_2.py on them, so the
-result is 100% consistent with the daily list — same filters, same
-ProfitRate source (weekly leaderboard pnl/vol), same everything.
-
-How it works:
-
-Resolve the input to a wallet address.
-If it already looks like a wallet (0x + 40 hex chars), use it as-is.
-Otherwise, search Polymarket's public profile search for an exact
-username match.
-Search the WEEKLY leaderboard for that wallet by paginating through
-it (same endpoint scraper_2.py uses) until found or until
-search_depth is reached. This finds their real rank, whatever it is.
-Run scraper_2.analyze_trader() — the SAME function the daily run
-uses — on their leaderboard entry. No separate/duplicate logic, so
-this can never drift out of sync with scraper_2.py as it evolves.
-Send the result to Telegram.
-Usage:
-python3 lookup_trader.py <username_or_wallet> [search_depth]
-
-search_depth: how many places into the weekly leaderboard to search
-before giving up (default 2000, hard cap 10000 — searching further
-costs more API calls/time, since each page is a separate request).
-"""
-import sys
-import os
-import re
+import html
 import json
+import re
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-import scraper_2 # reuse the exact same fetch/analysis logic — single source of truth
-
+DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
-TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+USER_AGENT = "PolyGunAssistant/2.0"
+PAGE_SIZE = 50
+INITIAL_POSITIONS = 300
+MAX_POSITIONS = 1000
+MIN_TIME_COVERAGE_DAYS = 14.0
+MAX_RETRIES = 3
+WALLET_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
-DEFAULT_SEARCH_DEPTH = 2000
-MAX_SEARCH_DEPTH = 10000
-LEADERBOARD_PAGE_SIZE = 50 # matches scraper_2.get_leaderboard's page size
 
-WALLET_RE = re.compile(r"^0x[a-fA-F0-9]{40}$" )
+def get_json(url, params=None):
+    if params:
+        url += ("&" if "?" in url else "?") + urlencode(params)
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+    last = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            with urlopen(request, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, ValueError) as error:
+            last = error
+            time.sleep(1.0 * (attempt + 1))
+    raise RuntimeError(f"API-fel: {last}")
 
-SKIP_REASONS_SV = {
-    "low_profit": f"profitrate under {scraper_2.MIN_PROFIT_RATE*100:.0f}%",
-    "implausible_profit_rate": f"profitrate över {scraper_2.MAX_PROFIT_RATE*100:.0f}% (troligen felaktig data, inte äkta)",
-    "trade_count": f"antal trades/vecka utanför {scraper_2.MIN_TRADES_PER_WEEK}-{scraper_2.MAX_TRADES_PER_WEEK}",
-    "small_sample": f"färre än {scraper_2.MIN_SAMPLE_SIZE} avgjorda trades — för tunt underlag",
-    "low_winrate": f"winrate under {scraper_2.MIN_WIN_RATE:.0f}%",
-    "insufficient_hold_data": "för lite hold-tid-data för att lita på snittet",
-    "unreliable_hold_data": f"hold-tid-datan täcker mindre än {scraper_2.MIN_HOLD_COVERAGE*100:.0f}% av trades — inte tillförlitlig",
-    "too_fast_to_copy": f"håller positioner under {scraper_2.MIN_HOLD_DAYS*1440:.0f} minuter i snitt — för snabb för att kunna copy-tradas",
-    "high_hold": f"håller positioner längre än {scraper_2.MAX_HOLD_DAYS} dagar i snitt",
-    "risky_loss_ratio": f"snittförlusten är mer än {scraper_2.MAX_LOSS_TO_WIN_RATIO}x snittvinsten — för riskabelt riskförhållande",
-}
 
 def resolve_wallet(identifier):
-    """Returns (wallet_address, matched_username) or (None, None)."""
-    if WALLET_RE.match(identifier):
-        return identifier, None
-    
-    url = f"{GAMMA_API}/public-search?" + urlencode({
+    identifier = identifier.strip()
+    if WALLET_RE.fullmatch(identifier):
+        return identifier, identifier
+    data = get_json(GAMMA_API + "/public-search", {
         "q": identifier, "search_profiles": "true",
     })
-    req = Request(url, headers={"User-Agent": scraper_2.USER_AGENT})
-    try:
-        with urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"Username-sökning misslyckades: {e}")
-        return None, None
-    
     profiles = data.get("profiles") or []
-    ident_lower = identifier.lower()
-    for p in profiles:
+    target = identifier.casefold().lstrip("@")
+    for profile in profiles:
         for field in ("name", "pseudonym", "xUsername"):
-            val = p.get(field)
-            if val and val.lower() == ident_lower:
-                return p.get("proxyWallet"), val
+            value = profile.get(field)
+            if value and value.casefold().lstrip("@") == target:
+                wallet = profile.get("proxyWallet") or profile.get("wallet")
+                if wallet:
+                    return wallet, value
     return None, None
 
-def find_in_leaderboard(wallet, search_depth):
-    """Paginate the weekly leaderboard looking for this wallet.
-    Returns (entry, rank) or (None, None) if not found within search_depth."""
-    wallet_lower = wallet.lower()
-    offset = 0
-    while offset < search_depth:
-        limit = min(LEADERBOARD_PAGE_SIZE, search_depth - offset)
-        try:
-            page = scraper_2.get_leaderboard_page(
-                "WEEK", "PNL", limit, offset
-            )
-        except (scraper_2.RateLimited, scraper_2.FetchError) as e:
-            print(f"Topplistan gick inte att hämta vid plats {offset}: {e}")
-            break
-        if not page:
-            break
-        for i, entry in enumerate(page):
-            if (entry.get("proxyWallet") or "").lower() == wallet_lower:
-                return entry, offset + i + 1
-        if len(page) < limit:
-            break
-        offset += limit
-    return None, None
 
-def get_trader_analysis(identifier, search_depth=DEFAULT_SEARCH_DEPTH):
-    wallet, matched_name = resolve_wallet(identifier)
-    if not wallet:
-        return f'Hittade ingen Polymarket-trader som matchar "{identifier}".'
-    
-    entry, rank = find_in_leaderboard(wallet, search_depth)
-    
-    if not entry:
-        return (
-            f'Hittade inte "{identifier}" inom topp {search_depth} i veckans topplista.\n'
-            f"Antingen har de för lite vinst/volym den här veckan för att synas alls, "
-            f"eller ligger de längre ner — testa ett större sökdjup (max {MAX_SEARCH_DEPTH})."
-        )
-    
-    name = entry.get("userName") or entry.get("xUsername") or (wallet[:8] + "…")
-    result = scraper_2.analyze_trader(entry)
-    
-    if result is None:
-        msg = f"{name} (plats {rank}) saknar wallet-data — kan inte analyseras."
-    elif "skip" in result:
-        reason = SKIP_REASONS_SV.get(result["skip"], result["skip"])
-        msg = (
-            f"<b>{name}</b> — plats {rank} i veckans topplista (sökt bland topp {search_depth}).\n"
-            f"❌ Klarar INTE dina kriterier just nu.\n"
-            f"Anledning: {reason}."
-        )
-    else:
-        username_for_link = entry.get("userName")
-        link_line = (
-            f'\n🔗 <a href="https://polymarket.com/@{username_for_link}">Profil</a>'
-            if username_for_link else ""
-         )
-        rr_display = result["RR"] if result["RR"] is not None else "∞ (inga förluster)"
-        msg = (
-            f"<b>{name}</b> — plats {rank} i veckans topplista (sökt bland topp {search_depth}).\n"
-            f"✅ Klarar ALLA dina kriterier!\n\n"
-            f"PR: {result['ProfitRate']*100:.1f}% | WR: {result['WinRate']}% | RR: {rr_display}\n"
-            f"Hold: {result['AvgHoldingDays']}d | Trades/vecka: {result['WeeklyTrades']} | "
-            f"Marknader: {result['MarketCount']}"
-            f"{link_line}"
-        )
-    return msg
+def fetch_positions(wallet, limit):
+    rows = []
+    for offset in range(0, limit, PAGE_SIZE):
+        page = get_json(DATA_API + "/closed-positions", {
+            "user": wallet,
+            "sortBy": "TIMESTAMP",
+            "sortDirection": "DESC",
+            "limit": PAGE_SIZE,
+            "offset": offset,
+        })
+        if not isinstance(page, list) or not page:
+            break
+        rows.extend(page)
+        if len(page) < PAGE_SIZE:
+            break
+        time.sleep(0.12)
+    return rows[:limit]
 
-def send_telegram(text):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID saknas — skickar inget, skriver bara ut.")
-        return
-    url = TELEGRAM_API.format(token=token)
-    data = urlencode({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode()
-    req = Request(url, data=data)
+
+def number(value):
     try:
-        with urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        if not result.get("ok"):
-            print(f"Telegram-sändning misslyckades: {result}")
-    except Exception as e:
-        print(f"Telegram-sändning misslyckades: {e}")
+        value = float(value)
+        return value if value == value else None
+    except (TypeError, ValueError):
+        return None
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 lookup_trader.py <username_or_wallet> [search_depth]")
-        sys.exit(1)
+def timestamp(value):
+    parsed = number(value)
+    if parsed is not None:
+        return parsed / 1000 if parsed > 10_000_000_000 else parsed
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
 
-    identifier = sys.argv[1]
-    search_depth = DEFAULT_SEARCH_DEPTH
-    if len(sys.argv) > 2:
-        try:
-            search_depth = int(sys.argv[2])
-        except ValueError:
-            pass
-    search_depth = max(1, min(search_depth, MAX_SEARCH_DEPTH))
 
-    msg = get_trader_analysis(identifier, search_depth)
-    print(msg)
-    send_telegram(msg)
+def analyze(wallet):
+    rows = fetch_positions(wallet, INITIAL_POSITIONS)
+    points = [(timestamp(r.get("timestamp")), number(r.get("realizedPnl"))) for r in rows]
+    points = sorted((t, p) for t, p in points if t is not None and p is not None)
+    mode = "300"
+    initial_span = None
+    if points:
+        initial_span = (points[-1][0] - points[0][0]) / 86400
+    if initial_span is None or initial_span < MIN_TIME_COVERAGE_DAYS:
+        rows = fetch_positions(wallet, MAX_POSITIONS)
+        mode = "upp till 1000"
+        points = [(timestamp(r.get("timestamp")), number(r.get("realizedPnl"))) for r in rows]
+        points = sorted((t, p) for t, p in points if t is not None and p is not None)
+    if not points:
+        return {"mode": mode, "count": 0}
+    by_day = defaultdict(float)
+    for t, pnl in points:
+        by_day[datetime.fromtimestamp(t, timezone.utc).date().isoformat()] += pnl
+    days = sorted(by_day)
+    daily = [by_day[d] for d in days]
+    cumulative = []
+    total = 0.0
+    for value in daily:
+        total += value
+        cumulative.append(total)
+    n = len(cumulative)
+    xm = (n - 1) / 2
+    ym = sum(cumulative) / n
+    ssx = sum((i - xm) ** 2 for i in range(n)) or 1
+    ssy = sum((v - ym) ** 2 for v in cumulative)
+    cov = sum((i - xm) * (v - ym) for i, v in enumerate(cumulative))
+    slope = cov / ssx
+    r2 = cov * cov / (ssx * ssy) if ssy else 0.0
+    peak = 0.0
+    drawdown = 0.0
+    for value in cumulative:
+        peak = max(peak, value)
+        drawdown = max(drawdown, peak - value)
+    return {
+        "mode": mode,
+        "count": len(points),
+        "days": (points[-1][0] - points[0][0]) / 86400,
+        "unique_days": len(days),
+        "oldest": datetime.fromtimestamp(points[0][0], timezone.utc).strftime("%Y-%m-%d"),
+        "newest": datetime.fromtimestamp(points[-1][0], timezone.utc).strftime("%Y-%m-%d"),
+        "total": total,
+        "slope": slope,
+        "r2": max(0.0, min(1.0, r2)),
+        "drawdown": drawdown,
+        "positive_days": sum(v > 0 for v in daily) / len(daily),
+    }
+
+
+def get_trader_analysis(identifier):
+    wallet, name = resolve_wallet(identifier)
+    if not wallet:
+        return f'Hittade ingen trader för "{html.escape(identifier)}".'
+    result = analyze(wallet)
+    shown_name = name or wallet
+    if not result.get("count"):
+        return f"<b>{html.escape(shown_name)}</b>\nIngen giltig stängd positionsdata hittades."
+    return (
+        f"<b>{html.escape(shown_name)}</b>\n"
+        f"Trader ID: <code>{html.escape(wallet)}</code>\n\n"
+        f"Kurvunderlag: {result['count']} positioner ({result['mode']})\n"
+        f"Historik: {result['days']:.1f} dagar, {result['unique_days']} handelsdagar\n"
+        f"Från: {result['oldest']} till {result['newest']}\n"
+        f"Total stängd PnL: {result['total']:.2f}\n"
+        f"Trendlinje: {'uppåtgående' if result['slope'] > 0 else 'inte uppåtgående'}\n"
+        f"Trend-R²: {result['r2']:.3f}\n"
+        f"Positiva dagar: {result['positive_days'] * 100:.1f}%\n"
+        f"Max drawdown: {result['drawdown']:.2f}\n\n"
+        "PR/WR/RR/Hold: N/A i denna enkla direktkurv-lookup."
+    )
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2:
+        print("Användning: python3 lookup_trader.py <username eller trader-ID>")
+        raise SystemExit(1)
+    print(get_trader_analysis(" ".join(sys.argv[1:])))
