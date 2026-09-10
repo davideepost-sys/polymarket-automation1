@@ -335,14 +335,18 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def lookup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Använd: /lookup <username, wallet eller profilänk>")
+        context.user_data["awaiting_lookup"] = True
+        await update.message.reply_text(
+            "Då ska vi se...\n"
+            "Behöver bara ett namn eller trader-ID, t.ex: DINTRADER123."
+        )
         return
     try:
         import lookup_trader
         result = lookup_trader.get_trader_analysis(" ".join(context.args))
     except Exception as error:
         result = f"Lookup kunde inte köras: {error}"
-    await update.message.reply_text(result)
+    await update.message.reply_text(result, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def run_daily_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -390,6 +394,17 @@ async def status_lookup_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     prompt = update.message.text.strip()
+
+    if context.user_data.pop("awaiting_lookup", False):
+        await update.message.reply_text("Toppen, ge mig en sekund så ska jag kolla...")
+        try:
+            import lookup_trader
+            result = lookup_trader.get_trader_analysis(prompt)
+        except Exception as error:
+            result = f"Lookup kunde inte köras: {error}"
+        await update.message.reply_text(result, parse_mode="HTML", disable_web_page_preview=True)
+        return CONVERSATION_STATE
+
     history = context.user_data.get("chat_history", [])
 
     if question_needs_trader_context(prompt):
