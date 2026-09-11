@@ -445,6 +445,7 @@ def main():
         future_to_entry = {executor.submit(analyze_trader, entry): entry for entry in lb}
         for future in as_completed(future_to_entry):
             completed += 1
+            entry = future_to_entry[future]
             result = future.result()
             if result is None:
                 skipped["no_wallet"] += 1
