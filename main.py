@@ -295,11 +295,13 @@ def get_latest_workflow_run_status(workflow_id):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["chat_history"] = []
+    context.user_data.pop("awaiting_lookup", None)
+    context.user_data.pop("awaiting_run_count", None)
     await update.message.reply_text(
         "PolyGun Assistant är redo.\n\n"
         "Jag läser aktuell traderdata när du uttryckligen frågar om den.\n"
         "Exempel: jämför trader 1 och 2, förklara RR 0,65 eller simulera 100 fiktiva trades.\n\n"
-        "Använd /help för kommandon och /clear för att rensa kort chatthistorik."
+        "Använd /help för att se tillgängliga kommandon."
     )
     return CONVERSATION_STATE
 
