@@ -35,7 +35,6 @@ jobs:
 
           event_path = os.environ.get("GITHUB_EVENT_PATH")
           pool_size = "100"
-
           if event_path and Path(event_path).exists():
               with open(event_path, encoding="utf-8") as handle:
                   event = json.load(handle)
@@ -48,13 +47,11 @@ jobs:
               ["python3", "scraper_versatility_clean.py", pool_size],
               check=True,
           )
-
           source_files = sorted(
               Path(".").glob("traders_*.csv"),
               key=lambda path: path.stat().st_mtime,
               reverse=True,
           )
-
           if not source_files:
               raise SystemExit("The clean clone scraper produced no traders_*.csv file")
 
@@ -64,12 +61,13 @@ jobs:
           )
           PY
 
-      - name: Upload isolated curve results
+      - name: Upload complete diagnostic artifacts
         uses: actions/upload-artifact@v4
         with:
           name: versatility-curve-results
           path: |
             traders_*.csv
+            trader_skip_diagnostics_*.csv
             versatility_curve_traders_*.csv
           retention-days: 30
           if-no-files-found: error
