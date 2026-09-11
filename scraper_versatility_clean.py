@@ -83,7 +83,7 @@ BACKOFF_SECONDS = 2.0
 POLITE_DELAY = 0.12
 
 MIN_TRADES_PER_WEEK = 21
-MAX_TRADES_PER_WEEK = 700
+MAX_TRADES_PER_WEEK = 1000
 MIN_SAMPLE_SIZE = 30            # keep a minimum sample, but inspect up to 2000 closed positions
 # Experimental net-profit floor.
 # PolyGun publishes 1% on each buy and sell = 2% round trip.
@@ -95,7 +95,7 @@ COST_RESERVE_RATE = POLYGUN_FEE_RESERVE + POLYMARKET_FEE_RESERVE
 # Discovery floor based on the supplied table:
 # 4.5% highest listed break-even + 0.2% max slippage + 0.5% safety margin.
 # This is a practical filter, not a guarantee for every market or trade.
-MIN_PROFIT_RATE = 0.052
+MIN_PROFIT_RATE = 0.047
 MAX_PROFIT_RATE = 1.00          # sanity ceiling: 200%+ weekly return on volume is
                                  # almost never real skill — reject as a probable data glitch
 MIN_WIN_RATE = 65.0
@@ -103,7 +103,8 @@ MIN_HOLD_DAYS = 0.02            # ~29 minutes. Below this, a trade closes
                                  # faster than a copy-bot can realistically
                                  # react — reject even if the number is real,
                                  # since it's not something you can copy.
-MAX_HOLD_DAYS = 1.5
+MAX_HOLD_DAYS = 2.0
+MAX_ESTIMATED_HOLD_DAYS = 6.0
 MIN_HOLD_COVERAGE = 0.30        # matched hold-times must cover at least 30% of a
                                  # trader's decided trades, or the average isn't trustworthy
 MAX_LOSS_TO_WIN_RATIO = 2.0     # reject if the average loss is more than 2x the
@@ -407,6 +408,7 @@ def analyze_trader(entry):
         "AvgWin": avg_win,
         "AvgLoss": avg_loss,
         "AvgHoldingDays": avg_hold,
+        "Hold": (f"{avg_hold:.2f}" if hold_data_reliable and avg_hold is not None else (f"~{avg_hold:.2f}" if avg_hold is not None else "N/A")),
         "MarketCount": len(markets),
         "_complete": complete,
         "sample": decided,
@@ -442,7 +444,7 @@ def main():
                "implausible_profit_rate": 0, "small_sample": 0,
                "low_winrate": 0, "too_fast_to_copy": 0, "high_hold": 0,
                "insufficient_hold_data": 0, "unreliable_hold_data": 0,
-               "risky_loss_ratio": 0}
+               "risky_loss_ratio": 0, "high_hold_estimated": 0}
     completed = 0
     total = len(lb)
 
@@ -493,7 +495,8 @@ def main():
     _safe_print(f"  - Skipped (not enough hold-time data): {skipped['insufficient_hold_data']}")
     _safe_print(f"  - Skipped (hold-time data covers < {MIN_HOLD_COVERAGE*100:.0f}% of trades): {skipped['unreliable_hold_data']}")
     _safe_print(f"  - Skipped (holding time < {MIN_HOLD_DAYS} days, too fast to copy): {skipped['too_fast_to_copy']}")
-    _safe_print(f"  - Skipped (holding time > {MAX_HOLD_DAYS} days): {skipped['high_hold']}")
+    _safe_print(f"  - Skipped (confirmed hold > {MAX_HOLD_DAYS} days): {skipped['high_hold']}")
+    _safe_print(f"  - Skipped (estimated hold > {MAX_ESTIMATED_HOLD_DAYS} days): {skipped['high_hold_estimated']}")
     _safe_print(f"  - Skipped (avg loss > {MAX_LOSS_TO_WIN_RATIO}x avg win): {skipped['risky_loss_ratio']}")
     _safe_print(f"  - Passed ALL filters: {len(filtered_traders)}")
 
@@ -568,7 +571,7 @@ def main():
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     out = f"traders_{stamp}.csv"
     cols = ["Name", "TraderID", "WeeklyTrades", "ProfitRate", "WinRate", "RR",
-            "AvgWin", "AvgLoss", "AvgHoldingDays", "HoldDataStatus", "MarketCount", "Score"]
+            "AvgWin", "AvgLoss", "Hold", "MarketCount", "Score"]
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
