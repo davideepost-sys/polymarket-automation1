@@ -92,7 +92,10 @@ POLYGUN_FEE_RESERVE = 0.02
 POLYMARKET_FEE_RESERVE = 0.04
 SAFETY_MARGIN_RESERVE = 0.00
 COST_RESERVE_RATE = POLYGUN_FEE_RESERVE + POLYMARKET_FEE_RESERVE
-MIN_PROFIT_RATE = 0.06
+# Discovery floor based on the supplied table:
+# 4.5% highest listed break-even + 0.2% max slippage + 0.5% safety margin.
+# This is a practical filter, not a guarantee for every market or trade.
+MIN_PROFIT_RATE = 0.052
 MAX_PROFIT_RATE = 1.00          # sanity ceiling: 200%+ weekly return on volume is
                                  # almost never real skill — reject as a probable data glitch
 MIN_WIN_RATE = 65.0
@@ -367,13 +370,15 @@ def analyze_trader(entry):
     if hold_coverage < MIN_HOLD_COVERAGE:
         hold_data_reliable = False
 
-    avg_hold = round(sum(holds) / len(holds), 2) if hold_data_reliable else None
-    if avg_hold is not None and avg_hold < MIN_HOLD_DAYS:
+    # Always show an approximate hold when at least one match exists.
+    # The status tells us whether it is reliable or only a rough estimate.
+    avg_hold = round(sum(holds) / len(holds), 2) if holds else None
+    if avg_hold is not None and hold_data_reliable and avg_hold < MIN_HOLD_DAYS:
         # Closes too fast to realistically copy-trade — likely latency-
         # sensitive arbitrage, not a repeatable strategy you can follow.
         return {"skip": "too_fast_to_copy", "trade_count": trade_count,
                  "win_rate": win_rate, "avg_hold": avg_hold}
-    if avg_hold is not None and avg_hold > MAX_HOLD_DAYS:
+    if avg_hold is not None and hold_data_reliable and avg_hold > MAX_HOLD_DAYS:
         return {"skip": "high_hold", "trade_count": trade_count, "win_rate": win_rate, "avg_hold": avg_hold}
 
     avg_win = round(sum(win_amounts) / len(win_amounts), 2) if win_amounts else 0.0
@@ -406,7 +411,7 @@ def analyze_trader(entry):
         "_complete": complete,
         "sample": decided,
         "matched": len(holds),
-        "HoldDataStatus": "OK" if hold_data_reliable else "N/A - insufficient matched hold data",
+        "HoldDataStatus": "OK" if hold_data_reliable else ("ESTIMATED - only %d matched" % len(holds)),
     }
 
 # ==========================================================================
@@ -481,7 +486,7 @@ def main():
     _safe_print(f"  - Traders checked: {total}")
     _safe_print(f"  - Skipped (no wallet): {skipped['no_wallet']}")
     _safe_print(f"  - Skipped (trade count outside {MIN_TRADES_PER_WEEK}-{MAX_TRADES_PER_WEEK}): {skipped['trade_count']}")
-    _safe_print(f"  - Skipped (profit rate < {MIN_PROFIT_RATE*100:.1f}%): {skipped['low_profit']}")
+    _safe_print(f"  - Skipped (profit rate < {MIN_PROFIT_RATE*100:.1f}% discovery floor): {skipped['low_profit']}")
     _safe_print(f"  - Skipped (profit rate > {MAX_PROFIT_RATE*100:.0f}%, likely bad data): {skipped['implausible_profit_rate']}")
     _safe_print(f"  - Skipped (sample size < {MIN_SAMPLE_SIZE}): {skipped['small_sample']}")
     _safe_print(f"  - Skipped (win rate < {MIN_WIN_RATE:.0f}%): {skipped['low_winrate']}")
