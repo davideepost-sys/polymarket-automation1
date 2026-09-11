@@ -361,17 +361,14 @@ def analyze_trader(entry):
     # of silently losing a potentially good trader. Hold is reported as N/A
     # and its copy-speed filters are not applied without reliable data.
 
-    # If only a small slice of a trader's decided trades have a matched
-    # buy-time, the average hold time is built off a cherry-picked handful,
-    # not a representative sample. This is what causes the fake "0.0 day"
-    # holds seen on very active traders — reject rather than trust it.
+    # If only a small slice has a matched buy-time, keep the trader but mark
+    # hold data unavailable; never invent a hold value or discard the trader.
     hold_coverage = len(holds) / decided
     if hold_coverage < MIN_HOLD_COVERAGE:
-        return {"skip": "unreliable_hold_data", "trade_count": trade_count,
-                 "win_rate": win_rate, "matched": len(holds), "sample": decided}
+        hold_data_reliable = False
 
-    avg_hold = round(sum(holds) / len(holds), 2)
-    if avg_hold < MIN_HOLD_DAYS:
+    avg_hold = round(sum(holds) / len(holds), 2) if hold_data_reliable else None
+    if avg_hold is not None and avg_hold < MIN_HOLD_DAYS:
         # Closes too fast to realistically copy-trade — likely latency-
         # sensitive arbitrage, not a repeatable strategy you can follow.
         return {"skip": "too_fast_to_copy", "trade_count": trade_count,
@@ -435,6 +432,7 @@ def main():
     _safe_print(f"Got {len(lb)} traders from leaderboard. Analyzing with {WORKERS} workers...\n")
 
     filtered_traders = []
+    skipped_details = []
     skipped = {"no_wallet": 0, "trade_count": 0, "low_profit": 0,
                "implausible_profit_rate": 0, "small_sample": 0,
                "low_winrate": 0, "too_fast_to_copy": 0, "high_hold": 0,
@@ -450,9 +448,22 @@ def main():
             result = future.result()
             if result is None:
                 skipped["no_wallet"] += 1
+                skipped_details.append({
+                    "Name": entry.get("userName") or entry.get("xUsername") or "N/A",
+                    "TraderID": entry.get("proxyWallet") or "N/A",
+                    "ProfitRate": profit_rate(entry),
+                    "SkipReason": "no_wallet",
+                })
                 continue
             if "skip" in result:
-                skipped[result["skip"]] += 1
+                reason = result["skip"]
+                skipped[reason] += 1
+                skipped_details.append({
+                    "Name": entry.get("userName") or entry.get("xUsername") or (entry.get("proxyWallet") or "N/A")[:12],
+                    "TraderID": entry.get("proxyWallet") or "N/A",
+                    "ProfitRate": profit_rate(entry),
+                    "SkipReason": reason,
+                })
                 if completed % 100 == 0:
                     _safe_print(f"  Progress: {completed}/{total} done, {len(filtered_traders)} passed so far")
                 continue
@@ -479,6 +490,18 @@ def main():
     _safe_print(f"  - Skipped (holding time > {MAX_HOLD_DAYS} days): {skipped['high_hold']}")
     _safe_print(f"  - Skipped (avg loss > {MAX_LOSS_TO_WIN_RATIO}x avg win): {skipped['risky_loss_ratio']}")
     _safe_print(f"  - Passed ALL filters: {len(filtered_traders)}")
+
+    # Write an audit file so we can see exactly where lower-PR candidates go.
+    audit_stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    audit_path = f"trader_skip_diagnostics_{audit_stamp}.csv"
+    with open(audit_path, "w", newline="", encoding="utf-8") as audit_file:
+        audit_writer = csv.DictWriter(
+            audit_file,
+            fieldnames=["Name", "TraderID", "ProfitRate", "SkipReason"],
+        )
+        audit_writer.writeheader()
+        audit_writer.writerows(skipped_details)
+    _safe_print(f"Wrote skip diagnostics -> {audit_path}")
 
     # ----------------------------------------------------------------
     # Score: computed HERE, not per-trader, because normalizing each
