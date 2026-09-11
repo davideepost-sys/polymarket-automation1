@@ -381,6 +381,8 @@ def analyze_trader(entry):
                  "win_rate": win_rate, "avg_hold": avg_hold}
     if avg_hold is not None and hold_data_reliable and avg_hold > MAX_HOLD_DAYS:
         return {"skip": "high_hold", "trade_count": trade_count, "win_rate": win_rate, "avg_hold": avg_hold}
+    if avg_hold is not None and not hold_data_reliable and avg_hold > MAX_ESTIMATED_HOLD_DAYS:
+        return {"skip": "high_hold_estimated", "trade_count": trade_count, "win_rate": win_rate, "avg_hold": avg_hold}
 
     avg_win = round(sum(win_amounts) / len(win_amounts), 2) if win_amounts else 0.0
     avg_loss = round(sum(loss_amounts) / len(loss_amounts), 2) if loss_amounts else 0.0
