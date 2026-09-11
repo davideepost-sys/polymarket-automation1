@@ -99,7 +99,7 @@ def analyze_latest_traders_for_digest():
         f"{trader_data}\n\n"
         "Ge en kort, professionell sammanfattning på svenska av vilka som ser mest lovande ut "
         "och varför. Använd endast uppgifterna i CSV:n. Fokusera på ProfitRate, WinRate, RR, "
-        "AvgWin, AvgLoss och AvgHoldingDays. Hitta inte på saknade värden; skriv N/A när ett "
+        "AvgWin, AvgLoss och Hold. Hitta inte på saknade värden; skriv N/A när ett "
         "fält saknas. Skriv inte investeringsråd och kalla inte en trader säker eller garanterad."
     )
 
@@ -108,3 +108,4 @@ def analyze_latest_traders_for_digest():
 
 if __name__ == "__main__":
     print(analyze_latest_traders_for_digest())
+    
