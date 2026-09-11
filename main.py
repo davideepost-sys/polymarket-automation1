@@ -118,7 +118,7 @@ def format_trader(index, row):
         f"Risk/Reward (RR): {value(row, 'RR')}\n"
         f"Genomsnittlig vinst: {value(row, 'AvgWin')} | "
         f"Genomsnittlig förlust: {value(row, 'AvgLoss')} | "
-        f"Genomsnittlig holdtid: {value(row, 'AvgHoldingDays')} dagar\n"
+        f"Hold: {value(row, 'Hold')} dagar\n"
     )
 
 
@@ -161,7 +161,7 @@ def compact_csv_context(rows, max_rows=100):
         "RR",
         "AvgWin",
         "AvgLoss",
-        "AvgHoldingDays",
+        "Hold",
         "MarketCount",
         "Score",
     ]
@@ -434,34 +434,23 @@ def main() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN saknas")
 
     app = Application.builder().token(token).build()
-    conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            CommandHandler("lookup", lookup_command),
-        ],
-        states={
-            CONVERSATION_STATE: [
-                CommandHandler("help", help_command),
-                CommandHandler("clear", clear_command),
-                CommandHandler("top", top_command),
-                CommandHandler("toptraders", top_command),
-                CommandHandler("lookup", lookup_command),
-                CommandHandler("run", run_daily_analysis_command),
-                CommandHandler("run_automation", run_automation_command),
-                CommandHandler("run_daily_analysis", run_daily_analysis_command),
-                CommandHandler("run_lookup", run_lookup_command),
-                CommandHandler("status_daily", status_daily_command),
-                CommandHandler("status_lookup", status_lookup_command),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
-            ]
-        },
-        fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("lookup", lookup_command),
-        ],
-        allow_reentry=True,
-    )
-    app.add_handler(conversation)
+
+    # Register commands globally. This guarantees a fixed response even when
+    # the user has not sent /start and avoids ConversationHandler state issues.
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("top", top_command))
+    app.add_handler(CommandHandler("toptraders", top_command))
+    app.add_handler(CommandHandler("lookup", lookup_command))
+    app.add_handler(CommandHandler("run", run_daily_analysis_command))
+    app.add_handler(CommandHandler("run_automation", run_automation_command))
+    app.add_handler(CommandHandler("run_daily_analysis", run_daily_analysis_command))
+    app.add_handler(CommandHandler("run_lookup", run_lookup_command))
+    app.add_handler(CommandHandler("status_daily", status_daily_command))
+    app.add_handler(CommandHandler("status_lookup", status_lookup_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     app.run_polling()
 
 
