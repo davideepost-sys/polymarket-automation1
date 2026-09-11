@@ -62,7 +62,7 @@ def format_trader(index, row):
         f"Risk/Reward (RR): {safe_value(row, 'RR')}\n"
         f"  Genomsnittlig vinst: {safe_value(row, 'AvgWin')} | "
         f"Genomsnittlig förlust: {safe_value(row, 'AvgLoss')} | "
-        f"Genomsnittlig holdtid: {safe_value(row, 'AvgHoldingDays')} dagar\n"
+        f"Hold: {safe_value(row, 'Hold')}\n"
     )
 
 
