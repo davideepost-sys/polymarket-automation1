@@ -307,25 +307,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Kommandon:\n"
-        "/start — börja om och rensa kort chatthistorik\n"
-        "/clear — rensa kort chatthistorik\n"
-        "/top — visa aktuell CSV direkt\n"
-        "/toptraders — samma som /top\n"
-        "/run [antal] — starta GitHub-körning, standard 500\n"
-        "/lookup <trader> — slå upp trader\n"
-        "/run_lookup <trader> — starta lookup-workflow\n"
-        "/status_daily — status för senaste körning\n"
-        "/status_lookup — status för senaste lookup\n\n"
-        "AI-frågor skrivs som vanlig text. Exempel:\n"
-        "Förklara RR 0,65.\n"
-        "Jämför trader 1 och trader 2.\n"
-        "Simulera 100 trades med 1000 USDC och 10 USDC per trade."
+        "/start — starta Assistant\n"
+        "/top — senaste traderlistan\n"
+        "/run — kör en ny analys\n"
+        "/lookup — slå upp en specifik trader\n"
+        "/help — visa denna hjälp"
     )
-
-
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["chat_history"] = []
-    await update.message.reply_text("Kort chatthistorik rensad.")
 
 
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -334,34 +321,37 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def lookup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        context.user_data["awaiting_lookup"] = True
-        await update.message.reply_text(
-            "Då ska vi se...\n"
-            "Behöver bara ett namn eller trader-ID, t.ex: DINTRADER123."
-        )
-        return
-    try:
-        import lookup_trader
-        result = lookup_trader.get_trader_analysis(" ".join(context.args))
-    except Exception as error:
-        result = f"Lookup kunde inte köras: {error}"
-    await update.message.reply_text(result, parse_mode="HTML", disable_web_page_preview=True)
+    context.user_data["awaiting_lookup"] = True
+    await update.message.reply_text(
+        "Då ska vi se...\n"
+        "Skriv traderns namn eller trader-ID, t.ex: DINTRADER123."
+    )
 
 
 async def run_daily_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    pool_size = 500
-    if context.args:
-        try:
-            pool_size = int(context.args[0])
-        except ValueError:
-            await update.message.reply_text("Använd exempelvis /run 500. Antalet måste vara ett heltal.")
-            return
+    if not context.args:
+        context.user_data["awaiting_run_count"] = True
+        await update.message.reply_text(
+            "Då kör vi! Hur många kandidater vill du testa från weekly leaderboard?\n"
+            "(Skriv antal, t.ex: 50, 100, 500.)"
+        )
+        return
+
+    await start_run_with_count(update, context, context.args[0])
+
+
+async def start_run_with_count(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_count: str) -> None:
+    try:
+        pool_size = int(raw_count.strip())
+    except ValueError:
+        await update.message.reply_text("Skriv bara ett heltal, till exempel 50, 100 eller 500.")
+        return
 
     if pool_size < 1 or pool_size > 1000:
         await update.message.reply_text("Antalet måste vara mellan 1 och 1000.")
         return
 
+    await update.message.reply_text(f"Toppen, då testar jag {pool_size} kandidater. Jag startar körningen nu...")
     ok, message = trigger_github_workflow(
         "daily_run_2.yml",
         {"pool_size": str(pool_size)},
@@ -373,36 +363,20 @@ async def run_automation_command(update: Update, context: ContextTypes.DEFAULT_T
     await run_daily_analysis_command(update, context)
 
 
-async def run_lookup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Använd: /run_lookup <username, wallet eller profilänk>")
-        return
-    ok, message = trigger_github_workflow(
-        "lookup_trader.yml",
-        {"trader": " ".join(context.args)},
-    )
-    await update.message.reply_text(message)
-
-
-async def status_daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(get_latest_workflow_run_status("daily_run_2.yml"))
-
-
-async def status_lookup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(get_latest_workflow_run_status("lookup_trader.yml"))
-
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     prompt = update.message.text.strip()
 
+    if context.user_data.pop("awaiting_run_count", False):
+        await start_run_with_count(update, context, prompt)
+        return CONVERSATION_STATE
+
     if context.user_data.pop("awaiting_lookup", False):
-        await update.message.reply_text("Toppen, ge mig en sekund så ska jag kolla...")
-        try:
-            import lookup_trader
-            result = lookup_trader.get_trader_analysis(prompt)
-        except Exception as error:
-            result = f"Lookup kunde inte köras: {error}"
-        await update.message.reply_text(result, parse_mode="HTML", disable_web_page_preview=True)
+        await update.message.reply_text("Toppen, jag startar lookup-körningen nu...")
+        ok, message = trigger_github_workflow(
+            "lookup_trader.yml",
+            {"trader": prompt},
+        )
+        await update.message.reply_text(message)
         return CONVERSATION_STATE
 
     history = context.user_data.get("chat_history", [])
@@ -439,16 +413,9 @@ def main() -> None:
     # the user has not sent /start and avoids ConversationHandler state issues.
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("top", top_command))
-    app.add_handler(CommandHandler("toptraders", top_command))
     app.add_handler(CommandHandler("lookup", lookup_command))
     app.add_handler(CommandHandler("run", run_daily_analysis_command))
-    app.add_handler(CommandHandler("run_automation", run_automation_command))
-    app.add_handler(CommandHandler("run_daily_analysis", run_daily_analysis_command))
-    app.add_handler(CommandHandler("run_lookup", run_lookup_command))
-    app.add_handler(CommandHandler("status_daily", status_daily_command))
-    app.add_handler(CommandHandler("status_lookup", status_lookup_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.run_polling()
