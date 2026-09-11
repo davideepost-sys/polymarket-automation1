@@ -435,7 +435,10 @@ def main() -> None:
 
     app = Application.builder().token(token).build()
     conversation = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CommandHandler("lookup", lookup_command),
+        ],
         states={
             CONVERSATION_STATE: [
                 CommandHandler("help", help_command),
@@ -452,7 +455,11 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
             ]
         },
-        fallbacks=[CommandHandler("start", start)],
+        fallbacks=[
+            CommandHandler("start", start),
+            CommandHandler("lookup", lookup_command),
+        ],
+        allow_reentry=True,
     )
     app.add_handler(conversation)
     app.run_polling()
