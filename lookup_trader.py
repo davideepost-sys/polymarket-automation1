@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
-"""Simple PolyMarket trader lookup by username or wallet/trader ID.
+"""Direct PolyMarket trader lookup.
 
-This lookup does not require the trader to be in the daily CSV or weekly
-leaderboard. It resolves a username through public profile search, then reads
-closed positions directly and reports a compact result.
+Accepts a username, wallet address, @username, or Polymarket profile URL.
+It never applies the daily-list thresholds. It resolves the trader, reads a
+large closed-position sample, calculates available metrics, and sends the
+result to Telegram when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
 """
+import argparse
 import html
 import json
 import re
-import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
-USER_AGENT = "PolyGunAssistant/2.0"
+USER_AGENT = "PolyGunAssistant/3.0"
 PAGE_SIZE = 50
-INITIAL_POSITIONS = 300
-MAX_POSITIONS = 1000
-MIN_TIME_COVERAGE_DAYS = 14.0
+CLOSED_LIMIT = 2000
+ACTIVITY_LIMIT = 2500
 MAX_RETRIES = 3
 WALLET_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
@@ -34,23 +34,43 @@ def get_json(url, params=None):
     last = None
     for attempt in range(MAX_RETRIES):
         try:
-            with urlopen(request, timeout=20) as response:
+            with urlopen(request, timeout=25) as response:
                 return json.loads(response.read().decode("utf-8"))
         except (HTTPError, URLError, TimeoutError, ValueError) as error:
             last = error
-            time.sleep(1.0 * (attempt + 1))
+            if attempt + 1 < MAX_RETRIES:
+                time.sleep(1.0 * (attempt + 1))
     raise RuntimeError(f"API-fel: {last}")
 
 
-def resolve_wallet(identifier):
-    identifier = identifier.strip()
+def clean_identifier(raw):
+    value = raw.strip()
+    if value.startswith("<") and value.endswith(">"):
+        value = value[1:-1]
+    if "://" in value:
+        parsed = urlparse(value)
+        path = parsed.path.strip("/")
+        parts = path.split("/")
+        if parts and parts[0] in {"@", "profile", "profiles"}:
+            parts = parts[1:]
+        if parts:
+            value = parts[-1]
+    return value.strip().lstrip("@").strip("/")
+
+
+def resolve_wallet(raw_identifier):
+    identifier = clean_identifier(raw_identifier)
     if WALLET_RE.fullmatch(identifier):
         return identifier, identifier
+
     data = get_json(GAMMA_API + "/public-search", {
-        "q": identifier, "search_profiles": "true",
+        "q": identifier,
+        "search_profiles": "true",
     })
     profiles = data.get("profiles") or []
-    target = identifier.casefold().lstrip("@")
+    target = identifier.casefold()
+
+    # Exact match first; never silently choose a similar username.
     for profile in profiles:
         for field in ("name", "pseudonym", "xUsername"):
             value = profile.get(field)
@@ -58,17 +78,27 @@ def resolve_wallet(identifier):
                 wallet = profile.get("proxyWallet") or profile.get("wallet")
                 if wallet:
                     return wallet, value
+
+    # A profile URL may resolve by slug even when public-search returns a
+    # slightly different display field. Only accept a unique result.
+    candidates = []
+    for profile in profiles:
+        wallet = profile.get("proxyWallet") or profile.get("wallet")
+        if wallet:
+            candidates.append((wallet, profile.get("name") or profile.get("pseudonym") or identifier))
+    unique = {wallet: name for wallet, name in candidates}
+    if len(unique) == 1:
+        wallet, name = next(iter(unique.items()))
+        return wallet, name
     return None, None
 
 
-def fetch_positions(wallet, limit):
+def fetch_pages(endpoint, params, limit):
     rows = []
     for offset in range(0, limit, PAGE_SIZE):
-        page = get_json(DATA_API + "/closed-positions", {
-            "user": wallet,
-            "sortBy": "TIMESTAMP",
-            "sortDirection": "DESC",
-            "limit": PAGE_SIZE,
+        page = get_json(DATA_API + endpoint, {
+            **params,
+            "limit": min(PAGE_SIZE, limit - offset),
             "offset": offset,
         })
         if not isinstance(page, list) or not page:
@@ -76,14 +106,14 @@ def fetch_positions(wallet, limit):
         rows.extend(page)
         if len(page) < PAGE_SIZE:
             break
-        time.sleep(0.12)
+        time.sleep(0.08)
     return rows[:limit]
 
 
 def number(value):
     try:
-        value = float(value)
-        return value if value == value else None
+        result = float(value)
+        return result if result == result else None
     except (TypeError, ValueError):
         return None
 
@@ -99,83 +129,139 @@ def timestamp(value):
 
 
 def analyze(wallet):
-    rows = fetch_positions(wallet, INITIAL_POSITIONS)
-    points = [(timestamp(r.get("timestamp")), number(r.get("realizedPnl"))) for r in rows]
-    points = sorted((t, p) for t, p in points if t is not None and p is not None)
-    mode = "300"
-    initial_span = None
-    if points:
-        initial_span = (points[-1][0] - points[0][0]) / 86400
-    if initial_span is None or initial_span < MIN_TIME_COVERAGE_DAYS:
-        rows = fetch_positions(wallet, MAX_POSITIONS)
-        mode = "upp till 1000"
-        points = [(timestamp(r.get("timestamp")), number(r.get("realizedPnl"))) for r in rows]
-        points = sorted((t, p) for t, p in points if t is not None and p is not None)
-    if not points:
-        return {"mode": mode, "count": 0}
-    by_day = defaultdict(float)
-    for t, pnl in points:
-        by_day[datetime.fromtimestamp(t, timezone.utc).date().isoformat()] += pnl
-    days = sorted(by_day)
-    daily = [by_day[d] for d in days]
-    cumulative = []
-    total = 0.0
-    for value in daily:
-        total += value
-        cumulative.append(total)
-    n = len(cumulative)
-    xm = (n - 1) / 2
-    ym = sum(cumulative) / n
-    ssx = sum((i - xm) ** 2 for i in range(n)) or 1
-    ssy = sum((v - ym) ** 2 for v in cumulative)
-    cov = sum((i - xm) * (v - ym) for i, v in enumerate(cumulative))
-    slope = cov / ssx
-    r2 = cov * cov / (ssx * ssy) if ssy else 0.0
-    peak = 0.0
-    drawdown = 0.0
-    for value in cumulative:
-        peak = max(peak, value)
-        drawdown = max(drawdown, peak - value)
+    closed = fetch_pages(
+        "/closed-positions",
+        {"user": wallet, "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
+        CLOSED_LIMIT,
+    )
+    activity = fetch_pages(
+        "/activity",
+        {"user": wallet, "type": "TRADE", "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
+        ACTIVITY_LIMIT,
+    )
+
+    pnls = [number(row.get("realizedPnl")) for row in closed]
+    pnls = [value for value in pnls if value is not None]
+    wins = [value for value in pnls if value > 0]
+    losses = [value for value in pnls if value < 0]
+    decided = len(wins) + len(losses)
+
+    # Match each close with the trader's own BUY timestamps per asset.
+    buys = defaultdict(deque)
+    for row in sorted(activity, key=lambda item: timestamp(item.get("timestamp")) or 0):
+        if str(row.get("side", "")).upper() != "BUY":
+            continue
+        asset = row.get("asset") or row.get("conditionId") or row.get("market")
+        ts = timestamp(row.get("timestamp"))
+        if asset and ts:
+            buys[asset].append(ts)
+
+    holds = []
+    for row in sorted(closed, key=lambda item: timestamp(item.get("timestamp")) or 0):
+        asset = row.get("asset") or row.get("conditionId") or row.get("market")
+        close_ts = timestamp(row.get("timestamp"))
+        if not asset or close_ts is None or not buys[asset]:
+            continue
+        while buys[asset] and buys[asset][0] > close_ts:
+            buys[asset].popleft()
+        if buys[asset]:
+            hold = (close_ts - buys[asset].popleft()) / 86400
+            if hold >= 0:
+                holds.append(hold)
+
+    newest = [timestamp(row.get("timestamp")) for row in closed]
+    newest = [value for value in newest if value is not None]
+    days = ((max(newest) - min(newest)) / 86400) if len(newest) >= 2 else None
+    total = sum(pnls) if pnls else None
+    avg_win = sum(wins) / len(wins) if wins else None
+    avg_loss = sum(losses) / len(losses) if losses else None
+    win_rate = (len(wins) / decided * 100) if decided else None
+    rr = (avg_win / abs(avg_loss)) if avg_win is not None and avg_loss else None
+    avg_hold = sum(holds) / len(holds) if holds else None
+
+    recent_cutoff = time_now() - 7 * 86400
+    weekly_trades = sum(1 for row in activity if (timestamp(row.get("timestamp")) or 0) >= recent_cutoff)
+
     return {
-        "mode": mode,
-        "count": len(points),
-        "days": (points[-1][0] - points[0][0]) / 86400,
-        "unique_days": len(days),
-        "oldest": datetime.fromtimestamp(points[0][0], timezone.utc).strftime("%Y-%m-%d"),
-        "newest": datetime.fromtimestamp(points[-1][0], timezone.utc).strftime("%Y-%m-%d"),
+        "closed_count": len(closed),
+        "activity_count": len(activity),
+        "weekly_trades": weekly_trades,
+        "decided": decided,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": win_rate,
         "total": total,
-        "slope": slope,
-        "r2": max(0.0, min(1.0, r2)),
-        "drawdown": drawdown,
-        "positive_days": sum(v > 0 for v in daily) / len(daily),
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "rr": rr,
+        "avg_hold": avg_hold,
+        "hold_matches": len(holds),
+        "days": days,
+        "oldest": min(newest) if newest else None,
+        "newest": max(newest) if newest else None,
     }
 
 
-def get_trader_analysis(identifier):
-    wallet, name = resolve_wallet(identifier)
-    if not wallet:
-        return f'Hittade ingen trader för "{html.escape(identifier)}".'
-    result = analyze(wallet)
-    shown_name = name or wallet
-    if not result.get("count"):
-        return f"<b>{html.escape(shown_name)}</b>\nIngen giltig stängd positionsdata hittades."
+def time_now():
+    return datetime.now(timezone.utc).timestamp()
+
+
+def fmt(value, digits=2):
+    return "N/A" if value is None else f"{value:.{digits}f}"
+
+
+def format_result(identifier, name, wallet, result):
+    if not result["closed_count"]:
+        return f"<b>{html.escape(name or identifier)}</b>\nIngen stängd positionsdata hittades.\nTrader ID: <code>{html.escape(wallet)}</code>"
     return (
-        f"<b>{html.escape(shown_name)}</b>\n"
+        f"<b>LOOKUP: {html.escape(name or identifier)}</b>\n"
         f"Trader ID: <code>{html.escape(wallet)}</code>\n\n"
-        f"Kurvunderlag: {result['count']} positioner ({result['mode']})\n"
-        f"Historik: {result['days']:.1f} dagar, {result['unique_days']} handelsdagar\n"
-        f"Från: {result['oldest']} till {result['newest']}\n"
-        f"Total stängd PnL: {result['total']:.2f}\n"
-        f"Trendlinje: {'uppåtgående' if result['slope'] > 0 else 'inte uppåtgående'}\n"
-        f"Trend-R²: {result['r2']:.3f}\n"
-        f"Positiva dagar: {result['positive_days'] * 100:.1f}%\n"
-        f"Max drawdown: {result['drawdown']:.2f}\n\n"
-        "PR/WR/RR/Hold: N/A i denna enkla direktkurv-lookup."
+        f"Weekly trades: {result['weekly_trades']}\n"
+        f"Stängda positioner: {result['closed_count']}\n"
+        f"Avgjorda positioner: {result['decided']} (vinster {result['wins']}, förluster {result['losses']})\n"
+        f"Profit/Loss totalt: {fmt(result['total'])}\n"
+        f"WinRate: {fmt(result['win_rate'], 1)}%\n"
+        f"AvgWin: {fmt(result['avg_win'])}\n"
+        f"AvgLoss: {fmt(result['avg_loss'])}\n"
+        f"RR: {fmt(result['rr'], 3)}\n"
+        f"Hold: {fmt(result['avg_hold'])} dagar ({result['hold_matches']} matchningar)\n"
+        f"Historik: {fmt(result['days'], 1)} dagar\n"
+        "Filter: inga daglistetrösklar använda."
     )
 
 
+def send_telegram(message):
+    import os
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("Telegram skickades inte: TELEGRAM_BOT_TOKEN eller TELEGRAM_CHAT_ID saknas.")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = urlencode({"chat_id": chat_id, "text": message, "parse_mode": "HTML"}).encode()
+    request = Request(url, data=payload, headers={"User-Agent": USER_AGENT}, method="POST")
+    with urlopen(request, timeout=20) as response:
+        result = json.loads(response.read().decode())
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram-fel: {result}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("identifier", help="username, wallet-ID eller Polymarket-profillänk")
+    parser.add_argument("--search-depth", default="2000", help="Behålls för workflow-kompatibilitet")
+    args = parser.parse_args()
+    try:
+        wallet, name = resolve_wallet(args.identifier)
+        if not wallet:
+            message = f'Hittade ingen trader för "{html.escape(args.identifier)}".'
+        else:
+            message = format_result(args.identifier, name, wallet, analyze(wallet))
+    except Exception as error:
+        message = f"Lookup kunde inte slutföras: {html.escape(str(error))}"
+    print(message)
+    send_telegram(message)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Användning: python3 lookup_trader.py <username eller trader-ID>")
-        raise SystemExit(1)
-    print(get_trader_analysis(" ".join(sys.argv[1:])))
+    main()
