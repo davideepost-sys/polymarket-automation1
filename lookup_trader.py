@@ -173,6 +173,11 @@ def analyze(wallet):
     newest = [value for value in newest if value is not None]
     days = ((max(newest) - min(newest)) / 86400) if len(newest) >= 2 else None
     total = sum(pnls) if pnls else None
+    sample_volume = sum(
+        value for value in (number(row.get("totalBought")) for row in closed)
+        if value is not None and value > 0
+    )
+    profit_rate = (total / sample_volume) if total is not None and sample_volume > 0 else None
     avg_win = sum(wins) / len(wins) if wins else None
     avg_loss = sum(losses) / len(losses) if losses else None
     win_rate = (len(wins) / decided * 100) if decided else None
@@ -191,6 +196,8 @@ def analyze(wallet):
         "losses": len(losses),
         "win_rate": win_rate,
         "total": total,
+        "sample_volume": sample_volume,
+        "profit_rate": profit_rate,
         "avg_win": avg_win,
         "avg_loss": avg_loss,
         "rr": rr,
@@ -219,14 +226,13 @@ def format_result(identifier, name, wallet, result):
         f"Weekly trades: {result['weekly_trades']}\n"
         f"Stängda positioner: {result['closed_count']}\n"
         f"Avgjorda positioner: {result['decided']} (vinster {result['wins']}, förluster {result['losses']})\n"
-        f"Profit/Loss totalt: {fmt(result['total'])}\n"
+        f"ProfitRate: {fmt(result['profit_rate'], 4)}\n"
         f"WinRate: {fmt(result['win_rate'], 1)}%\n"
         f"AvgWin: {fmt(result['avg_win'])}\n"
         f"AvgLoss: {fmt(result['avg_loss'])}\n"
         f"RR: {fmt(result['rr'], 3)}\n"
-        f"Hold: {fmt(result['avg_hold'])} dagar ({result['hold_matches']} matchningar)\n"
-        f"Historik: {fmt(result['days'], 1)} dagar\n"
-        "Filter: inga daglistetrösklar använda."
+        f"Avg Hold: {fmt(result['avg_hold'])} dagar ({result['hold_matches']} matchningar)\n"
+        f"Historik: baserat på cirka {fmt(result['days'], 1)} dagar bakåt i den hämtade datan."
     )
 
 
