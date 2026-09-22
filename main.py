@@ -30,13 +30,14 @@ CSV_PATH = PROJECT_DIR / "latest_traders.csv"
 GITHUB_REPO_OWNER = "davideepost-sys"
 GITHUB_REPO_NAME = "polymarket-automation1"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = "openai/gpt-oss-120b"
 USER_AGENT = "PolyGunAssistant/1.0"
 RAW_CSV_URL = (
     "https://raw.githubusercontent.com/"
     "davideepost-sys/polymarket-automation1/main/latest_traders.csv"
 )
-MAX_HISTORY_ITEMS = 10
+MAX_HISTORY_ITEMS = 6
+AI_PROMPT_CHAR_LIMIT = 14000
 TELEGRAM_MESSAGE_LIMIT = 3800
 
 AI_SYSTEM_PROMPT = """Du är PolyGun Assistant, en svensk AI-assistent för analys av Polymarket-traderdata.
@@ -50,6 +51,8 @@ Viktiga regler:
 6. Ett scenario med 100 trades är fiktivt. Visa antaganden och räkna bara med startkapital och fast summa eller procent per trade som användaren anger.
 7. Ge inte garanti om vinst eller stabil framtida utveckling. Detta är analys, inte garanterad finansiell rådgivning.
 8. Om frågan inte kan besvaras från CSV:n, säg exakt vilken information som saknas.
+9. Svara kort, enkelt och tydligt på svenska. Använd helst 3–6 korta stycken eller punkter.
+10. Blanda aldrig ihop olika traders. Om trader eller siffra saknas, säg det i stället för att gissa.
 """
 
 
@@ -199,16 +202,21 @@ def get_ai_response(prompt, system_prompt=AI_SYSTEM_PROMPT, chat_history=None):
     if not api_key:
         return "AI-fel: GROQ_API_KEY saknas på servern."
 
+    # Keep free-tier requests below the token-per-minute limit. The full CSV
+    # is not needed for a short conversational answer.
+    prompt = prompt[:AI_PROMPT_CHAR_LIMIT]
     messages = [{"role": "system", "content": system_prompt}]
     if chat_history:
-        messages.extend(chat_history[-MAX_HISTORY_ITEMS:])
+        for item in chat_history[-MAX_HISTORY_ITEMS:]:
+            content = str(item.get("content", ""))[:3000]
+            messages.append({"role": item.get("role", "user"), "content": content})
     messages.append({"role": "user", "content": prompt})
 
     data = {
         "model": GROQ_MODEL,
         "messages": messages,
-        "temperature": 0.4,
-        "max_tokens": 1400,
+        "temperature": 0.3,
+        "max_tokens": 900,
     }
 
     request = Request(
@@ -259,7 +267,7 @@ def trigger_github_workflow(workflow_id, inputs=None):
     try:
         response = requests.post(url, headers=headers, json=data, timeout=20)
         response.raise_for_status()
-        return True, "Workflow triggad. Kontrollera senare med /status_daily."
+        return True, "Körningen är startad."
     except Exception as error:
         return False, f"Workflow kunde inte startas: {error}"
 
@@ -385,6 +393,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if question_needs_trader_context(prompt):
         rows = read_latest_traders()
+        rows = rows[:20]
         prompt_for_ai = (
             "Användaren frågar om aktuell traderdata. Läs CSV-kontexten nedan och svara på svenska.\n\n"
             f"{compact_csv_context(rows)}\n\n"
